@@ -1,0 +1,45 @@
+# Noctalia configuration - installed to ~/.config/noctalia/config.toml by niriInstall.sh
+#
+# Placeholders below are filled in by the script (override via environment):
+#   __UI_FONT__        <- UI_FONT        (default: JetBrainsMono Nerd Font Propo)
+#   __THEME__          <- NOCTALIA_THEME (default: Tokyo-Night)
+#   __WALLPAPER_DIR__  <- WALLPAPER_DIR  (default: ~/Pictures/Wallpapers)
+#
+# Only non-default values are set; everything else falls back to Noctalia's
+# defaults. Hot-reloads on save. Defaults reference:
+#   https://github.com/noctalia-dev/noctalia/blob/main/example.toml
+
+[shell]
+font_family  = "__UI_FONT__"
+polkit_agent = true             # GUI auth prompts (no other polkit agent is installed)
+
+[theme]
+mode    = "dark"
+source  = "builtin"
+builtin = "__THEME__"
+
+# ── Bar (tutorial layout) ─────────────────────────────────────────────────────
+[bar.main]
+position = "top"
+start  = ["sysmon", "active_window", "media"]
+center = ["workspaces"]
+end    = ["tray", "battery", "volume", "clock", "control-center"]
+
+[widget.clock]
+format = "{:%H:%M %a, %b %d}"
+
+# ── Wallpaper (tutorial: rotate randomly every 5 minutes) ────────────────────
+[wallpaper]
+enabled             = true
+fill_mode           = "crop"
+transition_duration = 1500
+directory           = "__WALLPAPER_DIR__"
+
+[wallpaper.automation]
+enabled          = true
+interval_seconds = 300
+order            = "random"
+
+# Blurred wallpaper copy behind niri's Overview (pairs with the layer-rule in config.kdl).
+[backdrop]
+enabled = true
