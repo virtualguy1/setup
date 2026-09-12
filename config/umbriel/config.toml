@@ -1,0 +1,367 @@
+# Umbriel configuration - installed to ~/.config/umbriel/config.toml by umbrielInstall.sh
+# Docs: https://docs.noctalia.dev/umbriel/
+# Reference (all options): https://github.com/noctalia-dev/umbriel/blob/main/examples/config.toml
+#
+# Hot-reloads on save. Validate without starting the compositor:  umbriel validate
+# Press Mod+Shift+Slash inside Umbriel to see the keybind cheatsheet.
+#
+# Keybinds/look are ported from the niri setup (config/niri/config.kdl) and
+# follow Noctalia's Umbriel integration guide:
+#   https://docs.noctalia.dev/noctalia/compositor-settings/umbriel/
+
+# ─────────────────────────────── Includes ───────────────────────────────────
+[include]
+files = []
+
+# Noctalia writes a palette-matched colour file here when you enable
+# Settings -> Templates -> Compositors -> Umbriel. It appends itself to
+# [include].files automatically; listing it as optional keeps things working
+# before that happens.
+[include.optional]
+files = ["~/.config/umbriel/noctalia.toml"]
+
+# ─────────────────────────────── General ────────────────────────────────────
+[general]
+# Noctalia provides the bar, launcher, notifications, lock screen, wallpaper and OSD.
+autostart = ["noctalia"]
+mod_key = "Super"
+xwayland = true                 # requires xwayland-satellite on PATH
+show_cheatsheet = true          # keybind overlay on startup; any key dismisses
+focus_on_activate = false
+honor_restored_maximize = false
+
+[environment]
+ELECTRON_OZONE_PLATFORM_HINT = "auto"
+# SDL_VIDEODRIVER = "wayland"
+
+[events]
+# lid_close = "noctalia msg session lock"
+
+# ─────────────────────────────── Outputs ────────────────────────────────────
+# Run `umbriel outputs` to list connector names and available modes.
+# Example for a HiDPI laptop panel (uncomment and adjust):
+# [output.eDP-1]
+# mode = "3840x2400@60"
+# scale = 2.5
+# transform = "normal"
+# position = [0, 0]
+
+# ────────────────────────────── Workspaces ──────────────────────────────────
+[workspaces]
+back_and_forth = false
+empty_above = false
+
+# ─────────────────────────────── Colors ─────────────────────────────────────
+# Left unset on purpose: values in this file override every include, so setting
+# them here would defeat the Noctalia-generated palette (noctalia.toml).
+# Uncomment only if you do NOT use the Noctalia Umbriel template.
+# [colors.border]
+# focused = "#7FC8FFFF"
+# unfocused = "#505050FF"
+
+# ───────────────────────────── Appearance ───────────────────────────────────
+[appearance]
+prefer_no_csd = true
+border_width = 2
+outer_border_width = 0
+corner_radius = 10
+drag_opacity = 0.75
+
+[appearance.blur]
+enabled = true
+optimized = true
+passes = 3
+radius = 3
+noise = 0.02
+brightness = 0.9
+contrast = 0.9
+saturation = 1.1
+
+[appearance.shadow]
+enabled = true
+softness = 10
+offset_x = 2
+offset_y = 2
+
+# ──────────────────────────────── Input ─────────────────────────────────────
+[input]
+middle_click_paste = true
+
+[input.keyboard]
+layout = ""                     # e.g. "us"; empty uses the system default
+variant = ""
+options = ""                    # e.g. "compose:ralt,ctrl:nocaps"
+repeat_rate = 35
+repeat_delay = 200
+numlock_toggle = true
+
+[input.touchpad]
+tap = true
+# natural_scroll = true
+# disable_while_typing = true
+
+[input.mouse]
+sensitivity = 0.0
+scroll_wheel_step = 60
+
+[input.cursor]
+size = 24
+hardware_cursor = true
+follows_focus = false
+
+[input.focus]
+follows_mouse = true
+# follows_mouse_max_scroll = 0.5  # refuse hover-focus that would scroll the strip further than this
+
+# ─────────────────────────────── Keybinds ───────────────────────────────────
+# A [keybinds] table REPLACES Umbriel's built-in set: everything must be here.
+# Actions: https://docs.noctalia.dev/umbriel/actions/
+[keybinds]
+
+# Cheatsheet overlay
+"Mod+Shift+Slash" = "cheatsheet-toggle"
+
+# Applications
+"Mod+Return" = "spawn:alacritty"
+"Mod+T"      = "spawn:alacritty"
+
+# Noctalia desktop shell integration
+"Mod+Space"  = "spawn:noctalia msg panel-toggle launcher"
+"Mod+N"      = "spawn:noctalia msg panel-toggle control-center"
+"Mod+V"      = "spawn:noctalia msg panel-toggle clipboard"
+"Mod+Alt+L"  = "spawn:noctalia msg session lock"
+"Mod+Escape" = "spawn:noctalia msg panel-toggle session"
+"Alt+Tab"    = "spawn:noctalia msg window-switcher"
+
+# Volume & display brightness via Noctalia (shows the OSD); work while locked
+"XF86AudioRaiseVolume"  = { action = "spawn:noctalia msg volume-up",        allow_when_locked = true }
+"XF86AudioLowerVolume"  = { action = "spawn:noctalia msg volume-down",      allow_when_locked = true }
+"XF86AudioMute"         = { action = "spawn:noctalia msg volume-mute",      allow_when_locked = true }
+"XF86AudioMicMute"      = { action = "spawn:noctalia msg mic-mute",         allow_when_locked = true }
+"XF86MonBrightnessUp"   = { action = "spawn:noctalia msg brightness-up",    allow_when_locked = true }
+"XF86MonBrightnessDown" = { action = "spawn:noctalia msg brightness-down",  allow_when_locked = true }
+
+# Media playback
+"XF86AudioPlay"  = { action = "spawn:playerctl play-pause", allow_when_locked = true }
+"XF86AudioPause" = { action = "spawn:playerctl play-pause", allow_when_locked = true }
+"XF86AudioStop"  = { action = "spawn:playerctl stop",       allow_when_locked = true }
+"XF86AudioPrev"  = { action = "spawn:playerctl previous",   allow_when_locked = true }
+"XF86AudioNext"  = { action = "spawn:playerctl next",       allow_when_locked = true }
+
+# Window & overview management
+"Mod+O" = { action = "overview-toggle", repeat = false }
+"Mod+Q" = { action = "window-close",    repeat = false }
+
+# Focus navigation (arrows + vim keys + column ends)
+"Mod+Left"  = "window-focus-left"
+"Mod+Down"  = "window-focus-down"
+"Mod+Up"    = "window-focus-up"
+"Mod+Right" = "window-focus-right"
+"Mod+H"     = "window-focus-left"
+"Mod+J"     = "window-focus-down"
+"Mod+K"     = "window-focus-up"
+"Mod+L"     = "window-focus-right"
+"Mod+Home"  = "column-focus-first"
+"Mod+End"   = "column-focus-last"
+
+# Window & column movement
+"Mod+Ctrl+Left"  = "column-move-left"
+"Mod+Ctrl+Down"  = "window-move-down"
+"Mod+Ctrl+Up"    = "window-move-up"
+"Mod+Ctrl+Right" = "column-move-right"
+"Mod+Ctrl+H"     = "column-move-left"
+"Mod+Ctrl+J"     = "window-move-down"
+"Mod+Ctrl+K"     = "window-move-up"
+"Mod+Ctrl+L"     = "column-move-right"
+"Mod+Ctrl+Home"  = "column-move-to-first"
+"Mod+Ctrl+End"   = "column-move-to-last"
+
+# Multi-monitor navigation
+"Mod+Shift+Left"  = "output-focus-left"
+"Mod+Shift+Down"  = "output-focus-down"
+"Mod+Shift+Up"    = "output-focus-up"
+"Mod+Shift+Right" = "output-focus-right"
+
+"Mod+Shift+Ctrl+Left"  = "column-move-to-output-left"
+"Mod+Shift+Ctrl+Down"  = "column-move-to-output-down"
+"Mod+Shift+Ctrl+Up"    = "column-move-to-output-up"
+"Mod+Shift+Ctrl+Right" = "column-move-to-output-right"
+
+# Workspace navigation
+"Mod+Page_Down"       = "workspace-next"
+"Mod+Page_Up"         = "workspace-previous"
+"Mod+Ctrl+Page_Down"  = "column-move-to-workspace-next"
+"Mod+Ctrl+Page_Up"    = "column-move-to-workspace-previous"
+"Mod+Shift+Page_Down" = "workspace-move-down"
+"Mod+Shift+Page_Up"   = "workspace-move-up"
+"Mod+Tab"             = "workspace-focus-last"
+
+# Mouse wheel workspace & column navigation
+"Mod+WheelDown"      = { action = "workspace-next",                  cooldown_ms = 150 }
+"Mod+WheelUp"        = { action = "workspace-previous",              cooldown_ms = 150 }
+"Mod+Ctrl+WheelDown" = { action = "column-move-to-workspace-next",   cooldown_ms = 150 }
+"Mod+Ctrl+WheelUp"   = { action = "column-move-to-workspace-previous", cooldown_ms = 150 }
+
+"Mod+WheelRight"      = "window-focus-right"
+"Mod+WheelLeft"       = "window-focus-left"
+"Mod+Ctrl+WheelRight" = "column-move-right"
+"Mod+Ctrl+WheelLeft"  = "column-move-left"
+
+"Mod+Shift+WheelDown"      = "window-focus-right"
+"Mod+Shift+WheelUp"        = "window-focus-left"
+"Mod+Ctrl+Shift+WheelDown" = "column-move-right"
+"Mod+Ctrl+Shift+WheelUp"   = "column-move-left"
+
+# Workspaces (direct numeric navigation 1-9)
+"Mod+1" = "workspace-switch:1"
+"Mod+2" = "workspace-switch:2"
+"Mod+3" = "workspace-switch:3"
+"Mod+4" = "workspace-switch:4"
+"Mod+5" = "workspace-switch:5"
+"Mod+6" = "workspace-switch:6"
+"Mod+7" = "workspace-switch:7"
+"Mod+8" = "workspace-switch:8"
+"Mod+9" = "workspace-switch:9"
+
+"Mod+Shift+1" = "column-move-to-workspace:1"
+"Mod+Shift+2" = "column-move-to-workspace:2"
+"Mod+Shift+3" = "column-move-to-workspace:3"
+"Mod+Shift+4" = "column-move-to-workspace:4"
+"Mod+Shift+5" = "column-move-to-workspace:5"
+"Mod+Shift+6" = "column-move-to-workspace:6"
+"Mod+Shift+7" = "column-move-to-workspace:7"
+"Mod+Shift+8" = "column-move-to-workspace:8"
+"Mod+Shift+9" = "column-move-to-workspace:9"
+
+# Column & window grouping
+"Mod+BracketLeft"  = "window-consume-or-expel-left"
+"Mod+BracketRight" = "window-consume-or-expel-right"
+"Mod+Comma"        = "window-consume-left"
+"Mod+Period"       = "window-consume-right"
+
+# Size presets
+"Mod+R"            = "window-cycle-width"
+"Mod+Shift+R"      = "window-cycle-width-back"
+"Mod+Ctrl+Shift+R" = "window-cycle-height"
+"Mod+Ctrl+R"       = "window-cycle-height-back"
+
+# Window sizing & positioning
+"Mod+F"       = "window-toggle-maximize"           # full-width column
+"Mod+Shift+F" = "window-toggle-fullscreen"
+"Mod+M"       = "window-toggle-maximize-to-edges"  # no gaps/borders/struts
+
+# Column alignment
+"Mod+Shift+C" = "column-center"
+"Mod+Ctrl+C"  = "window-center"
+
+# Fine dimension adjustments
+"Mod+Minus"       = "window-modify-width:-0.1"
+"Mod+Equal"       = "window-modify-width:0.1"
+"Mod+Shift+Minus" = "window-modify-height:-0.1"
+"Mod+Shift+Equal" = "window-modify-height:0.1"
+
+# Floating & layout modes
+"Mod+Alt+V"   = "window-toggle-floating"
+"Mod+Shift+V" = "window-focus-switch-floating"
+"Mod+P"       = "window-toggle-pinned"
+"Mod+W"       = "workspace-set-layout:toggle"      # scrolling -> dwindle -> master
+
+# Scratchpad (implicit "default" scratchpad)
+"Mod+Shift+Space" = "window-move-to-scratchpad"
+"Mod+Ctrl+Space"  = "scratchpad-toggle"
+
+# Screenshots via Noctalia (saved under [shell.screenshot] settings)
+"Print"       = "spawn:noctalia msg screenshot-region"
+"Ctrl+Print"  = "spawn:noctalia msg screenshot-fullscreen"
+"Shift+Print" = "spawn:noctalia msg screenshot-annotate"
+
+# Session management
+"Mod+Shift+E"     = "session-quit"
+"Ctrl+Alt+Delete" = "session-quit"
+"Mod+Shift+P"     = "dpms-off"
+
+# ─────────────────────────────── Layout ─────────────────────────────────────
+[layout]
+mode = "scrolling"
+gap = 5
+width_presets = [0.333, 0.5, 0.667]
+
+[layout.scrolling]
+default_width_fraction = 0.5
+center_underfull_strip = true
+center_focused = "never"
+
+# ───────────────────────────── Window Rules ─────────────────────────────────
+# Blur every window (selectorless rule first so later rules can override).
+[[window_rule]]
+blur = true
+blur_optimized = true
+
+# Noctalia settings window floats with a predictable size.
+[[window_rule]]
+match.app_id = "^dev.noctalia.Noctalia$"
+default_floating = true
+default_size = [1080, 920]
+
+# Noctalia screen-share picker (xdg-desktop-portal-umbriel).
+[[window_rule]]
+match.app_id = "^dev.noctalia.UmbrielSharePicker$"
+default_floating = true
+default_size = [800, 600]
+
+# Browser picture-in-picture windows float in the bottom-right corner.
+[[window_rule]]
+match.title = "^(Picture-in-Picture|Picture in picture)$"
+default_floating = true
+default_maximize = false
+default_position = { x = 20, y = 20, anchor = "bottom_right" }
+
+# ────────────────────────────── Layer Rules ─────────────────────────────────
+# Blur Noctalia's bar, notifications, dock, panels and OSD.
+[[layer_rule]]
+match.namespace = "^noctalia-(bar-[^\"]+|notification|dock|panel|attached-panel|osd|desktop-widget-[^\"]*)$"
+blur = true
+blur_ignore_alpha = 0.5
+blur_popups = true
+blur_optimized = false
+
+# ────────────────────────────── Animation ───────────────────────────────────
+[animation]
+enabled = true
+duration_ms = 250
+curve = "easeout"
+
+[animation.windows_in]
+enabled = true
+duration_ms = 150
+style = "popin"
+scale = 0.85
+
+[animation.windows_out]
+enabled = true
+duration_ms = 150
+style = "fade"
+
+[animation.windows_move]
+enabled = true
+duration_ms = 250
+curve = "snappy"
+
+[animation.workspaces]
+enabled = true
+duration_ms = 250
+
+[animation.overview]
+enabled = true
+duration_ms = 250
+workspace_curve = "spring:1,1000"
+
+# ─────────────────────── Overview and Hot Corners ───────────────────────────
+[overview]
+zoom = 0.5
+background_blur = true
+
+[hot_corners.top_left]
+enabled = true
+delay_ms = 500
+action = "overview-open"

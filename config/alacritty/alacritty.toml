@@ -1,4 +1,4 @@
-# Alacritty configuration - installed by niriInstall.sh
+# Alacritty configuration - installed by niriInstall.sh / umbrielInstall.sh
 # The font family placeholder below is filled from $MONO_FONT by the script.
 [font]
 size = 11.0
