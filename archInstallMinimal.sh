@@ -1,30 +1,57 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Arch Linux Minimal Installation Script (UEFI / GPT)
+# Arch Linux Minimal Installation Script — Intel edition (UEFI / GPT)
 #
-# A trimmed-down variant of archInstall.sh. Same partitioning, bootloader and
-# system configuration, but a deliberately minimal package set:
-#   - GPT layout: 1G EFI + swap + ext4 root (remainder of disk)
-#   - GRUB (x86_64-efi) with a --removable fallback entry
-#   - NetworkManager, systemd-timesyncd
-#   - linux-zen kernel (override with KERNEL=linux / linux-lts)
-#   - Auto-detected CPU microcode
-#   - Hardware-specific linux-firmware-* split packages instead of the full
-#     linux-firmware meta package
-#   - sudo instead of base-devel (no compiler toolchain)
-#   - No graphics (mesa/vulkan), audio (pipewire) or cosmetic packages; those
-#     belong in a post-install / desktop stage.
+# A variant of archInstallMinimal.sh tailored to Intel laptops with an Intel
+# integrated GPU (validated on an 11th-gen Intel Core / Iris Xe Lenovo
+# ThinkPad X1 Yoga, Gen 6). Same partitioning, bootloader and system
+# configuration as the other scripts, but with two fixes over the generic
+# minimal script:
+#
+#   1. AUDIO: the generic minimal script installed no audio server at all,
+#      and its firmware auto-detection never installed `sof-firmware`. Many
+#      recent Intel laptops (this ThinkPad included — confirmed on its
+#      ArchWiki page) use a cAVS/SOF audio DSP and produce NO sound without
+#      it, regardless of which HDA codec is present. This script installs
+#      sof-firmware + the full PipeWire stack (pipewire, pipewire-audio,
+#      pipewire-alsa, pipewire-pulse, wireplumber, rtkit) + alsa-utils, and
+#      globally enables the PipeWire user units so audio works after first
+#      boot without any manual `systemctl --user` step.
+#
+#   2. GRAPHICS: mesa + vulkan-intel + intel-media-driver are now installed
+#      unconditionally for the Iris Xe (or any Gen8+ Intel) iGPU, instead of
+#      being left out entirely as in the generic minimal script.
+#
+#   3. LAPTOP / WAYLAND BASE: this script is intended as the foundation for a
+#      Wayland compositor install, so it also ships the compositor-agnostic
+#      pieces such a session needs on this hardware: polkit, Bluetooth,
+#      power-profiles-daemon, thermald, iio-sensor-proxy, fprintd,
+#      brightnessctl, a baseline font set, and base-devel/git for AUR builds.
+#      The compositor itself, login manager, portals and Qt/XWayland shims are
+#      deliberately left to a post-install step.
+#
+# Vendor auto-detection for AMD CPUs/GPUs and Wi-Fi vendors other than
+# Intel/Realtek has been removed on purpose — this script assumes an Intel
+# platform. Use archInstallMinimal.sh if you need broader hardware coverage.
+#
+# Not configured (by design): disk encryption, hibernation (swap is overflow
+# only), a display/login manager.
 #
 # Every default in the "Configuration" section can be overridden from the
-# environment, e.g.:  KEYMAP=de-latin1 SWAP_SIZE=8G ./archInstallMinimal.sh
+# environment, e.g.:  KEYMAP=de-latin1 SWAP_SIZE=8G ./archInstallMinimalIntel.sh
 #
-# Firmware overrides:
+# Other overrides:
+#   USER_SHELL=zsh                  login shell for the regular user (package
+#                                   name == binary name; default bash)
 #   FULL_FIRMWARE=1                 install the full linux-firmware meta package
 #                                   instead of the detected subset
 #   EXTRA_FIRMWARE="pkg1 pkg2"      append firmware packages to the detected set
 # ==============================================================================
 
-set -euo pipefail
+# -E (errtrace) is required so the ERR trap below also fires for failures
+# inside functions and subshells; without it, `set -e` still exits but the
+# cleanup handler is skipped.
+set -Eeuo pipefail
 
 # ------------------------------------------------------------------------------
 # Configuration (override via environment)
@@ -34,11 +61,17 @@ LOCALE="${LOCALE:-en_US.UTF-8}"
 KEYMAP="${KEYMAP:-us}"
 DEFAULT_HOSTNAME="${DEFAULT_HOSTNAME:-archlinux}"
 EFI_SIZE="${EFI_SIZE:-1G}"
+# SWAP_SIZE is sized for memory overflow only. Hibernation is NOT configured:
+# no `resume` initramfs hook and no `resume=` kernel parameter are set up, and
+# 4G is far smaller than RAM on the target hardware. Suspend-to-RAM works.
 SWAP_SIZE="${SWAP_SIZE:-4G}"
 BOOTLOADER_ID="${BOOTLOADER_ID:-GRUB}"
 KERNEL="${KERNEL:-linux-zen}"
 FULL_FIRMWARE="${FULL_FIRMWARE:-0}"
 EXTRA_FIRMWARE="${EXTRA_FIRMWARE:-}"
+# Login shell for the regular user. Must be both a package name and the name of
+# the binary it installs (bash, zsh, fish, dash, ...). bash ships with `base`.
+USER_SHELL="${USER_SHELL:-bash}"
 
 # ------------------------------------------------------------------------------
 # Logging
@@ -59,21 +92,29 @@ log_title()   { echo -e "\n${COLOR_TITLE}=== $* ===${COLOR_RESET}"; }
 # ------------------------------------------------------------------------------
 # Error Handling
 # ------------------------------------------------------------------------------
-# On any failure: report the line, unmount whatever is under /mnt, disable
-# swap, and exit with the original status.
-cleanup_on_err() {
+# The ERR trap only records where the failure happened; the EXIT trap does the
+# actual cleanup. Splitting them this way means cleanup also runs for explicit
+# `exit 1` calls (which do not trigger ERR), while a successful run (exit 0)
+# leaves everything alone.
+ERR_LINE=""
+trap 'ERR_LINE=$LINENO' ERR
+
+cleanup_on_exit() {
   local exit_code=$?
   if [[ $exit_code -ne 0 ]]; then
-    log_error "Installation failed on line $1 with exit code $exit_code."
+    if [[ -n "${ERR_LINE}" ]]; then
+      log_error "Installation failed on line ${ERR_LINE} with exit code ${exit_code}."
+    else
+      log_error "Installation aborted with exit code ${exit_code}."
+    fi
     if mountpoint -q /mnt 2>/dev/null; then
       log_warn "Unmounting filesystems under /mnt..."
       umount -R /mnt 2>/dev/null || log_warn "Could not fully unmount /mnt; run manually: umount -R /mnt"
     fi
     swapoff -a 2>/dev/null || true
   fi
-  exit "$exit_code"
 }
-trap 'cleanup_on_err $LINENO' ERR
+trap cleanup_on_exit EXIT
 
 # ------------------------------------------------------------------------------
 # Helper Functions
@@ -108,10 +149,12 @@ check_internet() {
 prompt_secure_password() {
   local prompt_label="$1"
   local pass1 pass2
+  # IFS= prevents read from trimming leading/trailing whitespace, which would
+  # otherwise silently alter passwords like " secret ".
   while true; do
-    read -rsp "Enter ${prompt_label} password: " pass1
+    IFS= read -rsp "Enter ${prompt_label} password: " pass1
     echo >&2
-    read -rsp "Confirm ${prompt_label} password: " pass2
+    IFS= read -rsp "Confirm ${prompt_label} password: " pass2
     echo >&2
     if [[ -z "${pass1}" ]]; then
       log_warn "Password cannot be empty. Please try again." >&2
@@ -176,7 +219,7 @@ log_title "Phase 1: Pre-flight Checks"
 
 # 1. Root privileges
 if [[ "${EUID}" -ne 0 ]]; then
-  log_error "This script must be executed with root privileges. Run with: sudo ./archInstallMinimal.sh"
+  log_error "This script must be executed with root privileges. Run with: sudo ./archInstallMinimalIntel.sh"
   exit 1
 fi
 log_success "Running as root."
@@ -196,14 +239,21 @@ if [[ "${UEFI_BITNESS}" != "64" ]]; then
 fi
 log_success "64-bit UEFI boot mode verified."
 
-# 3. Console keymap (live session only; persisted to the target in Phase 6)
+# 3. Login shell name sanity check (the package itself is verified by pacstrap)
+if [[ ! "${USER_SHELL}" =~ ^[a-z][a-z0-9_.-]*$ ]]; then
+  log_error "Invalid USER_SHELL '${USER_SHELL}'. Expected a plain package/binary name such as bash, zsh or fish."
+  exit 1
+fi
+log_info "User login shell: ${USER_SHELL}"
+
+# 4. Console keymap (live session only; persisted to the target in Phase 6)
 log_info "Applying keymap: ${KEYMAP}"
 loadkeys "${KEYMAP}" 2>/dev/null || log_warn "Could not load keymap '${KEYMAP}', continuing with system default."
 
-# 4. Internet connectivity
+# 5. Internet connectivity
 check_internet
 
-# 5. System clock
+# 6. System clock
 #    An accurate clock avoids package signature and TLS failures during
 #    pacstrap, so wait briefly (up to 15 s) for NTP to report sync.
 log_info "Synchronizing system clock via NTP..."
@@ -222,7 +272,7 @@ else
   log_warn "NTP did not report synchronization within 15s. Continuing; package signature checks may fail if the clock is badly off."
 fi
 
-# 6. Pacman mirrors (best-effort; falls back to the ISO default list)
+# 7. Pacman mirrors (best-effort; falls back to the ISO default list)
 if command -v reflector &>/dev/null; then
   log_info "Ranking pacman mirrors with reflector (this may take a moment)..."
   if reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist 2>/dev/null; then
@@ -397,33 +447,44 @@ lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS "${DISK}"
 log_title "Phase 5: Hardware Detection & Pacstrap"
 
 # 1. CPU vendor / microcode
+#    This variant targets Intel platforms (validated on an 11th-gen Intel
+#    Core / Iris Xe ThinkPad X1 Yoga). AMD is still detected so the correct
+#    microcode is chosen if this script ends up run on the wrong machine, but
+#    the graphics/audio package set below assumes Intel either way.
 CPU_VENDOR="unknown"
 CPU_UCODE=""
-if grep -qi "AuthenticAMD" /proc/cpuinfo; then
-  CPU_VENDOR="amd"
-  CPU_UCODE="amd-ucode"
-  log_info "AMD processor detected. Selected microcode: amd-ucode"
-elif grep -qi "GenuineIntel" /proc/cpuinfo; then
+if grep -qi "GenuineIntel" /proc/cpuinfo; then
   CPU_VENDOR="intel"
   CPU_UCODE="intel-ucode"
   log_info "Intel processor detected. Selected microcode: intel-ucode"
+elif grep -qi "AuthenticAMD" /proc/cpuinfo; then
+  CPU_VENDOR="amd"
+  CPU_UCODE="amd-ucode"
+  log_warn "AMD processor detected, but this script's graphics/audio package set is tailored for Intel. Continuing anyway."
 else
   log_info "Unknown or virtual CPU vendor. Skipping microcode package."
 fi
+log_info "Detected CPU vendor: ${CPU_VENDOR}"
 
-# 2. Firmware selection
-#    linux-firmware is a meta package that pulls in every vendor split package
-#    (several hundred MB). Instead, pick the split packages matching the PCI /
-#    USB vendors actually present, plus linux-firmware-other as a catch-all.
-#
-#    PCI vendor IDs:
-#      8086 Intel            1002 AMD/ATI GPU       1022 AMD CPU/chipset
-#      10ec Realtek          168c Qualcomm Atheros  17cb Qualcomm (ath11k/12k)
-#      14e4 Broadcom         14c3 MediaTek          11ab/1b4b Marvell
-#      10de NVIDIA (unsupported by this script)
-#    USB vendor IDs (mainly Wi-Fi / Bluetooth combos):
-#      8087 Intel            0bda Realtek           0cf3 Qualcomm Atheros
-#      0a5c Broadcom         0e8d MediaTek          1286 Marvell
+# 2. Graphics (Intel iGPU — Iris Xe / any Gen8+ Intel graphics)
+#    mesa provides the 'iris' OpenGL driver, vulkan-intel the ANV Vulkan
+#    driver, and intel-media-driver the modern iHD VAAPI driver used for
+#    hardware video decode/encode. Installed unconditionally since this
+#    script targets Intel-iGPU laptops.
+GPU_PACKAGES=(mesa vulkan-intel intel-media-driver)
+GPU_INFO=$(lspci -nnk 2>/dev/null | grep -i -E "vga|3d|display" || true)
+if echo "${GPU_INFO}" | grep -qi "Intel"; then
+  log_info "Intel GPU detected. Installing mesa, vulkan-intel, and intel-media-driver."
+else
+  log_warn "No Intel GPU detected via lspci, but installing the Intel graphics stack anyway (this script targets Intel iGPUs)."
+fi
+
+# 3. Firmware selection (Wi-Fi / Bluetooth / misc peripherals)
+#    Same split-package approach as the generic minimal script, trimmed to
+#    the vendors actually relevant to an Intel ThinkPad: Intel (always, for
+#    Wi-Fi/BT/iGPU GuC-HuC), Realtek (some SKUs ship a Realtek Wi-Fi/BT
+#    combo instead of Intel's), and Cirrus Logic (the smart amp used on
+#    several recent ThinkPads' Dolby Atmos speaker setup, detected via ACPI).
 FIRMWARE_PACKAGES=()
 if [[ "${FULL_FIRMWARE}" == "1" ]]; then
   log_info "FULL_FIRMWARE=1: installing the complete linux-firmware meta package."
@@ -435,55 +496,30 @@ else
   # Catch-all for miscellaneous devices not covered by a vendor package.
   FIRMWARE_PACKAGES+=(linux-firmware-other)
 
-  # Intel: iGPU (GuC/HuC), Wi-Fi (iwlwifi), Bluetooth, SOF audio DSP.
-  if [[ "${CPU_VENDOR}" == "intel" ]] || has_vendor "${PCI_VENDORS}" 8086 || has_vendor "${USB_VENDORS}" 8087; then
-    FIRMWARE_PACKAGES+=(linux-firmware-intel)
-  fi
+  # Intel: Wi-Fi (iwlwifi), Bluetooth, iGPU GuC/HuC. Always included.
+  FIRMWARE_PACKAGES+=(linux-firmware-intel)
 
-  # AMD CPU/chipset (SEV, PSP, PMF, etc.).
-  if [[ "${CPU_VENDOR}" == "amd" ]] || has_vendor "${PCI_VENDORS}" 1022; then
-    FIRMWARE_PACKAGES+=(linux-firmware-amd)
-  fi
-
-  # AMD/ATI GPU: amdgpu for GCN and newer, radeon for older chips. Both are
-  # included since telling them apart reliably by device ID is impractical.
-  if has_vendor "${PCI_VENDORS}" 1002; then
-    FIRMWARE_PACKAGES+=(linux-firmware-amdgpu linux-firmware-radeon)
-  fi
-
-  # Realtek: ethernet (r8169 firmware), Wi-Fi (rtw88/rtw89), Bluetooth.
+  # Realtek Wi-Fi/BT combo (rtw88/rtw89), if present instead of Intel's.
+  # Note: PCI vendor 10ec also matches Realtek Ethernet NICs (r8169), which
+  # pull this package in on more machines than just Realtek Wi-Fi SKUs. That
+  # is harmless — r8169 loads its rtl_nic firmware from the same package.
   if has_vendor "${PCI_VENDORS}" 10ec || has_vendor "${USB_VENDORS}" 0bda; then
     FIRMWARE_PACKAGES+=(linux-firmware-realtek)
+    log_info "Realtek device detected; adding linux-firmware-realtek."
   fi
 
-  # Qualcomm Atheros: ath9k/ath10k/ath11k/ath12k Wi-Fi and Bluetooth.
-  if has_vendor "${PCI_VENDORS}" 168c 17cb || has_vendor "${USB_VENDORS}" 0cf3; then
-    FIRMWARE_PACKAGES+=(linux-firmware-atheros)
-  fi
-
-  # Broadcom: Wi-Fi (brcmfmac), Bluetooth, NICs.
-  if has_vendor "${PCI_VENDORS}" 14e4 || has_vendor "${USB_VENDORS}" 0a5c; then
-    FIRMWARE_PACKAGES+=(linux-firmware-broadcom)
-  fi
-
-  # MediaTek: Wi-Fi (mt76) and Bluetooth.
-  if has_vendor "${PCI_VENDORS}" 14c3 || has_vendor "${USB_VENDORS}" 0e8d; then
-    FIRMWARE_PACKAGES+=(linux-firmware-mediatek)
-  fi
-
-  # Marvell: Wi-Fi (mwifiex) and some NICs. Optional dep of linux-firmware.
-  if has_vendor "${PCI_VENDORS}" 11ab 1b4b || has_vendor "${USB_VENDORS}" 1286; then
-    FIRMWARE_PACKAGES+=(linux-firmware-marvell)
-  fi
-
-  # Cirrus Logic: CS35L41/CS35L56 speaker amplifiers used by many recent
-  # laptops. They sit on I2C/SPI, so detect them via their ACPI IDs.
-  if ls /sys/bus/acpi/devices 2>/dev/null | grep -qiE '^(CSC35|CLSA)'; then
+  # Cirrus Logic smart amp (CS35L41/CS35L56), sits on I2C/SPI so detect via
+  # its ACPI ID rather than PCI/USB.
+  CIRRUS_AMP_FOUND=0
+  for acpi_dev in /sys/bus/acpi/devices/CSC35* /sys/bus/acpi/devices/CLSA*; do
+    if [[ -e "${acpi_dev}" ]]; then
+      CIRRUS_AMP_FOUND=1
+      break
+    fi
+  done
+  if [[ "${CIRRUS_AMP_FOUND}" -eq 1 ]]; then
     FIRMWARE_PACKAGES+=(linux-firmware-cirrus)
-  fi
-
-  if has_vendor "${PCI_VENDORS}" 10de; then
-    log_warn "NVIDIA GPU detected. NVIDIA is not supported by this script; linux-firmware-nvidia is NOT installed."
+    log_info "Cirrus Logic smart amp detected; adding linux-firmware-cirrus."
   fi
 
   if [[ -n "${EXTRA_FIRMWARE}" ]]; then
@@ -492,18 +528,72 @@ else
   fi
 
   log_info "Detected firmware set: ${FIRMWARE_PACKAGES[*]}"
-  log_warn "If a device (especially Wi-Fi) is missing firmware after reboot, install the matching linux-firmware-* package or the full 'linux-firmware' meta package."
 fi
 
-# 3. Package list
+# 4. Audio (Sound Open Firmware + PipeWire stack)
+#    THE FIX: the generic minimal script installed no audio server, and its
+#    firmware detection never installed sof-firmware. This ThinkPad's own
+#    ArchWiki page states it requires Sound Open Firmware for the soundcard
+#    to work at all — the HDA codec alone is not enough on cAVS/SOF
+#    platforms.
+#
+#    Package roles (validated against the Arch package database):
+#      sof-firmware    DSP firmware. Nothing depends on it, so it MUST be listed.
+#      pipewire        The daemon only. Audio support is an *optdepend*, hence:
+#      pipewire-audio  ALSA/Bluetooth SPA plugins — without this PipeWire has no
+#                      audio at all. Listed explicitly rather than relying on it
+#                      arriving transitively via pipewire-pulse.
+#      pipewire-alsa   Routes pure-ALSA clients through PipeWire instead of
+#                      letting them grab the hardware device directly.
+#      pipewire-pulse  PulseAudio API for browsers and most desktop apps.
+#      wireplumber     Session manager. Listed explicitly so pacstrap never has
+#                      to prompt for a 'pipewire-session-manager' provider.
+#      rtkit           Realtime scheduling for the PipeWire threads (fewer
+#                      xruns under load). Optional for sound to work at all.
+#      alsa-utils      Not required for sound; provides alsamixer/amixer/
+#                      speaker-test used in the post-install checks below.
+#
+#    alsa-ucm-conf (the sof-hda-dsp UCM profile) is NOT listed: alsa-lib hard-
+#    depends on it, and pipewire-audio depends on alsa-lib, so it is always
+#    installed anyway.
+AUDIO_PACKAGES=(sof-firmware pipewire pipewire-audio pipewire-alsa pipewire-pulse wireplumber rtkit alsa-utils)
+
+# 5. Laptop platform services & desktop prerequisites
+#    Compositor-agnostic pieces a Wayland session on this hardware needs, so
+#    the compositor itself can be layered on afterwards. Daemons are enabled
+#    in the chroot step; fprintd and iio-sensor-proxy are D-Bus activated.
+LAPTOP_PACKAGES=(
+  # polkit is only an *optdepend* of networkmanager ("let non-root users
+  # control networking") — without it nmcli/nmtui fail for the regular user,
+  # and every Wayland session needs a polkit authority anyway.
+  polkit
+
+  bluez bluez-utils         # Bluetooth stack (PipeWire BT plugins need bluetoothd)
+  power-profiles-daemon     # Platform power profiles (Fn+H/L/M on this ThinkPad)
+  thermald                  # Intel thermal management
+  iio-sensor-proxy          # Rotation sensor (X1 Yoga)
+  fprintd                   # Fingerprint reader (Synaptics 06cb:00fc via libfprint)
+  brightnessctl             # Backlight control for compositor keybinds
+
+  # Fonts: without at least one font every Wayland client renders tofu.
+  noto-fonts noto-fonts-emoji ttf-dejavu
+)
+
+# 6. Package list
 BASE_PACKAGES=(
   # Core system
   base
   "${KERNEL}"
 
-  # Privilege escalation (base-devel is intentionally omitted; sudo is the
-  # only piece of it this install relies on)
-  sudo
+  # Build tooling — required for makepkg / AUR (the compositor build-out
+  # will need it). base-devel includes sudo.
+  base-devel
+  git
+
+  # Documentation & pacman helpers
+  man-db
+  man-pages
+  pacman-contrib
 
   # Filesystem tools (fsck for ext4 / FAT32)
   e2fsprogs
@@ -520,17 +610,34 @@ BASE_PACKAGES=(
 if [[ -n "${CPU_UCODE}" ]]; then
   BASE_PACKAGES+=("${CPU_UCODE}")
 fi
+# bash is already provided by `base`; anything else must be installed.
+if [[ "${USER_SHELL}" != "bash" ]]; then
+  BASE_PACKAGES+=("${USER_SHELL}")
+fi
 BASE_PACKAGES+=("${FIRMWARE_PACKAGES[@]}")
+BASE_PACKAGES+=("${GPU_PACKAGES[@]}")
+BASE_PACKAGES+=("${AUDIO_PACKAGES[@]}")
+BASE_PACKAGES+=("${LAPTOP_PACKAGES[@]}")
 
 log_info "Packages to be installed via pacstrap:"
 printf '  - %s\n' "${BASE_PACKAGES[@]}"
 
-# 4. Install
+# 7. Install
 log_info "Running pacstrap on /mnt (this may take a few minutes)..."
 pacstrap -K /mnt "${BASE_PACKAGES[@]}"
 log_success "Base system packages installed successfully."
 
-# 5. fstab
+# 8. Target pacman.conf: coloured output and parallel downloads. The live ISO
+#    already enables these for pacstrap, but the installed system's config is
+#    stock. The sed patterns only touch the commented-out defaults, so a
+#    future pacman.conf that ships them enabled is left untouched.
+log_info "Enabling Color and ParallelDownloads in the target pacman.conf..."
+sed -i \
+  -e 's/^#Color$/Color/' \
+  -e 's/^#ParallelDownloads = .*/ParallelDownloads = 5/' \
+  /mnt/etc/pacman.conf
+
+# 9. fstab
 log_info "Generating fstab using persistent UUIDs..."
 genfstab -U /mnt >> /mnt/etc/fstab
 log_success "fstab generated. Contents:"
@@ -541,7 +648,7 @@ cat /mnt/etc/fstab
 # ------------------------------------------------------------------------------
 log_title "Phase 6: System Configuration (Chroot)"
 
-log_info "Configuring timezone, locale, keymap, initramfs, hostname, sudoers, services, and GRUB bootloader in chroot..."
+log_info "Configuring timezone, locale, keymap, initramfs, hostname, sudoers, services, audio, and GRUB bootloader in chroot..."
 
 # The chroot script is stored in a variable and passed via `bash -c` (rather
 # than piped on stdin) so that no command inside it can accidentally consume
@@ -580,7 +687,19 @@ cat <<HOSTS_EOF > /etc/hosts
 HOSTS_EOF
 
 # 5. User account & sudo (wheel group via a drop-in, not /etc/sudoers)
-useradd -m -G wheel -s /bin/bash "${USERNAME}"
+#    Resolve the login shell inside the chroot so we get the real path the
+#    package installed (e.g. /usr/bin/zsh) and can confirm it is registered in
+#    /etc/shells before handing it to useradd.
+USER_SHELL_PATH=$(command -v "${USER_SHELL}" || true)
+if [[ -z "${USER_SHELL_PATH}" ]]; then
+  echo "[ERROR] Login shell '${USER_SHELL}' not found in the installed system." >&2
+  exit 1
+fi
+if ! grep -qxF -- "${USER_SHELL_PATH}" /etc/shells; then
+  echo "[ERROR] '${USER_SHELL_PATH}' is not listed in /etc/shells." >&2
+  exit 1
+fi
+useradd -m -G wheel -s "${USER_SHELL_PATH}" "${USERNAME}"
 mkdir -p /etc/sudoers.d
 echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/10-wheel
 chmod 0440 /etc/sudoers.d/10-wheel
@@ -588,14 +707,34 @@ chmod 0440 /etc/sudoers.d/10-wheel
 # 6. Services
 systemctl enable NetworkManager
 systemctl enable systemd-timesyncd
+systemctl enable fstrim.timer             # weekly SSD TRIM (util-linux)
+systemctl enable bluetooth
+systemctl enable power-profiles-daemon
+systemctl enable thermald
 
-# 7. GRUB bootloader
+# 7. Audio services
+#    The Arch pipewire, pipewire-pulse and wireplumber packages already ship
+#    their user units pre-enabled via symlinks under
+#    /usr/lib/systemd/user/*.wants/, so this is normally a no-op. It is kept
+#    as a belt-and-braces guarantee in case packaging changes. `--global`
+#    enables user units for every account without an active login session
+#    (arch-chroot has no running systemd, so `systemctl --user` would fail).
+systemctl --global enable pipewire.socket pipewire-pulse.socket wireplumber.service
+
+# 8. GRUB bootloader
 #    The primary install registers an NVRAM boot entry. The additional
 #    --removable install places a copy at the UEFI fallback path
 #    (EFI/BOOT/BOOTX64.EFI) for firmware that ignores or loses NVRAM entries.
 grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id="${BOOTLOADER_ID}" --recheck
 grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --recheck \
   || echo "[WARN] Fallback (--removable) GRUB install failed; primary NVRAM entry is still in place." >&2
+#    Single-boot install: os-prober is not installed, so tell grub-mkconfig
+#    not to look for it (silences the "os-prober will not be executed" warning).
+if grep -q '^#\?GRUB_DISABLE_OS_PROBER=' /etc/default/grub; then
+  sed -i 's/^#\?GRUB_DISABLE_OS_PROBER=.*/GRUB_DISABLE_OS_PROBER=true/' /etc/default/grub
+else
+  echo 'GRUB_DISABLE_OS_PROBER=true' >> /etc/default/grub
+fi
 grub-mkconfig -o /boot/grub/grub.cfg
 CHROOT_EOF
 )
@@ -606,6 +745,7 @@ arch-chroot /mnt /usr/bin/env \
   KEYMAP="${KEYMAP}" \
   TARGET_HOSTNAME="${TARGET_HOSTNAME}" \
   USERNAME="${USERNAME}" \
+  USER_SHELL="${USER_SHELL}" \
   BOOTLOADER_ID="${BOOTLOADER_ID}" \
   bash -euo pipefail -c "${CHROOT_SCRIPT}"
 
@@ -626,26 +766,39 @@ swapoff -a 2>/dev/null || true
 
 echo
 echo -e "${COLOR_SUCCESS}========================================================================${COLOR_RESET}"
-echo -e "${COLOR_SUCCESS}        Arch Linux Minimal Installation Completed Successfully!         ${COLOR_RESET}"
+echo -e "${COLOR_SUCCESS}     Arch Linux Minimal (Intel) Installation Completed Successfully!    ${COLOR_RESET}"
 echo -e "${COLOR_SUCCESS}========================================================================${COLOR_RESET}"
 echo
 echo "System Summary:"
 echo "  - Hostname : ${TARGET_HOSTNAME}"
-echo "  - User     : ${USERNAME} (member of wheel / sudo enabled)"
+echo "  - User     : ${USERNAME} (shell: ${USER_SHELL}, member of wheel / sudo enabled)"
 echo "  - Timezone : ${TIMEZONE}"
 echo "  - Locale   : ${LOCALE}"
 echo "  - Keymap   : ${KEYMAP}"
 echo "  - Kernel   : ${KERNEL}"
 echo "  - Boot     : GRUB UEFI (/boot/efi, with removable fallback)"
-echo "  - Network  : NetworkManager enabled"
-echo "  - Time     : systemd-timesyncd enabled"
+echo "  - Swap     : ${SWAP_SIZE} partition (overflow only; hibernation NOT configured)"
+echo "  - Services : NetworkManager, systemd-timesyncd, fstrim.timer, bluetooth,"
+echo "               power-profiles-daemon, thermald"
+echo "  - Graphics : mesa, vulkan-intel, intel-media-driver (Intel iGPU)"
+echo "  - Audio    : ${AUDIO_PACKAGES[*]} (PipeWire user units enabled)"
+echo "  - Laptop   : ${LAPTOP_PACKAGES[*]}"
 echo "  - Firmware : ${FIRMWARE_PACKAGES[*]}"
+echo "  - Pacman   : Color + ParallelDownloads enabled"
 echo
 echo "Not installed (add in a post-install step as needed):"
-echo "  - Graphics : mesa, vulkan-radeon / vulkan-intel, intel-media-driver"
-echo "  - Audio    : pipewire, pipewire-pulse, wireplumber, sof-firmware"
-echo "  - Devel    : base-devel (needed for makepkg / AUR)"
 echo "  - Editor   : nano or vim"
+echo "  - Wayland  : your compositor, a login manager (e.g. greetd), xorg-xwayland,"
+echo "               qt5/qt6-wayland, xdg-desktop-portal + backend, a polkit agent"
+echo
+echo "After first login, verify audio with:"
+echo "  wpctl status         # confirm PipeWire sees the sink"
+echo "  speaker-test -c 2    # should play through PipeWire (pipewire-alsa)"
+echo "  alsamixer            # press F6, select 'sof-hda-dsp', ensure Master/Speaker are unmuted"
+echo "  journalctl -b | grep -i sof   # must NOT show 'sof firmware file is missing'"
+echo
+echo "This model also has a rotation sensor, IR camera, and webcam covered on its"
+echo "ArchWiki page (Lenovo ThinkPad X1 Yoga (Gen 6)) if you install a DE later."
 echo
 echo "Next Steps:"
 echo "  1. Remove your Arch Linux live USB drive."
