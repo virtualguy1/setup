@@ -18,13 +18,15 @@
 #     (tutorial bar layout & theme; font/theme/wallpaper dir filled from env vars)
 #   - ~/.config/alacritty/alacritty.toml  <- copied from ./config/alacritty/alacritty.toml
 #     (font filled from MONO_FONT)
+#   - $WALLPAPER_DIR seeded with the images in ./config/Wallpapers (never overwrites)
 #   - Optional: auto-start niri when logging in on TTY1
+#     (disable at any time with: touch ~/.no-niri-autostart)
 #
 # Every default in the "Configuration" section can be overridden from the
 # environment, e.g.:  AUTOSTART_NIRI=no INSTALL_BROWSER=no ./niriInstall.sh
 # ==============================================================================
 
-set -euo pipefail
+set -Eeuo pipefail
 
 # Directory containing this script; bundled config files live under ./config/.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,20 +47,36 @@ MONO_FONT="${MONO_FONT:-JetBrainsMono Nerd Font}"
 # ------------------------------------------------------------------------------
 # Logging
 # ------------------------------------------------------------------------------
-COLOR_RESET="\033[0m"
-COLOR_INFO="\033[1;34m"
-COLOR_WARN="\033[1;33m"
-COLOR_ERROR="\033[1;31m"
-COLOR_SUCCESS="\033[1;32m"
-COLOR_TITLE="\033[1;36m"
+# Colors only when stdout is a terminal (and NO_COLOR is unset), so piping to a
+# log file does not fill it with escape codes.
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  COLOR_RESET=$'\033[0m'
+  COLOR_INFO=$'\033[1;34m'
+  COLOR_WARN=$'\033[1;33m'
+  COLOR_ERROR=$'\033[1;31m'
+  COLOR_SUCCESS=$'\033[1;32m'
+  COLOR_TITLE=$'\033[1;36m'
+else
+  COLOR_RESET="" COLOR_INFO="" COLOR_WARN="" COLOR_ERROR="" COLOR_SUCCESS="" COLOR_TITLE=""
+fi
 
-log_info()    { echo -e "${COLOR_INFO}[INFO]${COLOR_RESET} $*"; }
-log_warn()    { echo -e "${COLOR_WARN}[WARN]${COLOR_RESET} $*"; }
-log_error()   { echo -e "${COLOR_ERROR}[ERROR]${COLOR_RESET} $*" >&2; }
-log_success() { echo -e "${COLOR_SUCCESS}[OK]${COLOR_RESET} $*"; }
-log_title()   { echo -e "\n${COLOR_TITLE}=== $* ===${COLOR_RESET}"; }
+log_info()    { printf '%s[INFO]%s %s\n'  "${COLOR_INFO}"    "${COLOR_RESET}" "$*"; }
+log_warn()    { printf '%s[WARN]%s %s\n'  "${COLOR_WARN}"    "${COLOR_RESET}" "$*"; }
+log_error()   { printf '%s[ERROR]%s %s\n' "${COLOR_ERROR}"   "${COLOR_RESET}" "$*" >&2; }
+log_success() { printf '%s[OK]%s %s\n'    "${COLOR_SUCCESS}" "${COLOR_RESET}" "$*"; }
+log_title()   { printf '\n%s=== %s ===%s\n' "${COLOR_TITLE}" "$*" "${COLOR_RESET}"; }
 
-trap 'log_error "Script failed on line $LINENO."' ERR
+trap 'log_error "Script failed on line ${LINENO}: ${BASH_COMMAND}"' ERR
+
+# Resources released on exit (success or failure).
+AUR_BUILD_DIR=""
+SUDO_KEEPALIVE_PID=""
+cleanup() {
+  [[ -n "${SUDO_KEEPALIVE_PID}" ]] && kill "${SUDO_KEEPALIVE_PID}" 2>/dev/null
+  [[ -n "${AUR_BUILD_DIR}" && -d "${AUR_BUILD_DIR}" ]] && rm -rf "${AUR_BUILD_DIR}"
+  return 0
+}
+trap cleanup EXIT
 
 # ------------------------------------------------------------------------------
 # Helper Functions
@@ -77,9 +95,9 @@ ask_yes_no() {
 resolve_choice() {
   local value="$1" prompt="$2" default="$3"
   case "${value}" in
-    yes|YES|y|Y) return 0 ;;
-    no|NO|n|N)   return 1 ;;
-    *)           ask_yes_no "${prompt}" "${default}" ;;
+    yes) return 0 ;;
+    no)  return 1 ;;
+    *)   ask_yes_no "${prompt}" "${default}" ;;
   esac
 }
 
@@ -91,6 +109,11 @@ backup_file() {
     mv "${file}" "${backup}"
     log_warn "Existing $(basename "${file}") backed up to ${backup}"
   fi
+}
+
+# Escape a string for use as a literal sed replacement (delimiter is '|').
+escape_sed() {
+  printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'
 }
 
 # Decide whether a config file should be (re)written.
@@ -112,11 +135,29 @@ should_write_config() {
 # ------------------------------------------------------------------------------
 log_title "Phase 1: Pre-flight Checks"
 
+# Validate environment overrides early so a typo fails before any prompts.
+# Values are lower-cased in place so later checks can compare exact strings.
+validate_option() {
+  local name="$1" allowed="$2" value
+  value="${!name,,}"
+  if [[ " ${allowed} " != *" ${value} "* ]]; then
+    log_error "Invalid ${name}='${!name}'. Allowed values: ${allowed// /, }"
+    exit 1
+  fi
+  printf -v "${name}" '%s' "${value}"
+}
+validate_option INSTALL_BROWSER   "yes no"
+validate_option AUTOSTART_NIRI    "yes no ask"
+validate_option OVERWRITE_CONFIGS "yes no ask"
+validate_option AUR_HELPER        "yay paru"
+log_success "Configuration options valid."
+
 if [[ "${EUID}" -eq 0 ]]; then
   log_error "Do not run this script as root. Run it as your normal user; it will call sudo when needed."
   exit 1
 fi
-log_success "Running as user '${USER}'."
+CURRENT_USER="$(id -un)"
+log_success "Running as user '${CURRENT_USER}'."
 
 if ! command -v pacman &>/dev/null; then
   log_error "pacman not found. This script is for Arch Linux."
@@ -130,13 +171,19 @@ fi
 
 log_info "Checking sudo access (you may be prompted for your password)..."
 if ! sudo -v; then
-  log_error "sudo authentication failed. Is '${USER}' in the wheel group?"
+  log_error "sudo authentication failed. Is '${CURRENT_USER}' in the wheel group?"
   exit 1
 fi
 log_success "sudo access verified."
 
+# Keep the sudo timestamp fresh so long pacman/makepkg runs never re-prompt.
+( while kill -0 "$$" 2>/dev/null; do sudo -n true 2>/dev/null; sleep 50; done ) &
+SUDO_KEEPALIVE_PID=$!
+
 log_info "Verifying internet connection..."
-if ! (ping -c 1 -W 3 archlinux.org &>/dev/null || ping -c 1 -W 3 1.1.1.1 &>/dev/null); then
+# HTTPS first (works where ICMP is filtered); ping as a fallback if curl is missing.
+if ! ( curl -fsI --max-time 5 https://archlinux.org &>/dev/null \
+    || ping -c 1 -W 3 1.1.1.1 &>/dev/null ); then
   log_error "No internet connection. Connect first (e.g. nmtui) and re-run."
   exit 1
 fi
@@ -179,16 +226,27 @@ PACKAGES=(
   noto-fonts
   noto-fonts-emoji
   polkit
+
+  # Build tooling (AUR helper bootstrap; generally useful on a desktop)
+  git
+  base-devel
 )
 
 AUR_PACKAGES=()
-if [[ "${INSTALL_BROWSER}" =~ ^[Yy] ]]; then
+if [[ "${INSTALL_BROWSER}" == "yes" ]]; then
   AUR_PACKAGES+=("${BROWSER_PKG}")
-  PACKAGES+=(git base-devel)   # needed to build the AUR helper
 fi
 
+# power-profiles-daemon conflicts with tlp / auto-cpufreq; skip it if either is present.
+INSTALL_PPD="no"
 if [[ "${IS_LAPTOP}" == "yes" ]]; then
-  PACKAGES+=(brightnessctl upower power-profiles-daemon)
+  PACKAGES+=(brightnessctl upower)
+  if pacman -Qq tlp &>/dev/null || pacman -Qq auto-cpufreq &>/dev/null; then
+    log_warn "tlp/auto-cpufreq detected; skipping power-profiles-daemon (they conflict)."
+  else
+    PACKAGES+=(power-profiles-daemon)
+    INSTALL_PPD="yes"
+  fi
 fi
 
 log_info "Packages to install:"
@@ -198,7 +256,7 @@ log_info "Synchronizing package databases and installing (this may take a while)
 sudo pacman -Syu --needed --noconfirm "${PACKAGES[@]}"
 log_success "Packages installed."
 
-if [[ "${IS_LAPTOP}" == "yes" ]]; then
+if [[ "${INSTALL_PPD}" == "yes" ]]; then
   sudo systemctl enable --now power-profiles-daemon.service 2>/dev/null \
     || log_warn "Could not enable power-profiles-daemon; continuing."
 fi
@@ -211,10 +269,9 @@ if [[ ${#AUR_PACKAGES[@]} -gt 0 ]]; then
 
   if ! command -v "${AUR_HELPER}" &>/dev/null; then
     log_info "AUR helper '${AUR_HELPER}' not found. Bootstrapping ${AUR_HELPER}-bin from the AUR..."
-    AUR_BUILD_DIR=$(mktemp -d)
+    AUR_BUILD_DIR=$(mktemp -d)   # removed by the EXIT trap, even on failure
     git clone --depth 1 "https://aur.archlinux.org/${AUR_HELPER}-bin.git" "${AUR_BUILD_DIR}/${AUR_HELPER}-bin"
     (cd "${AUR_BUILD_DIR}/${AUR_HELPER}-bin" && makepkg -si --noconfirm --needed)
-    rm -rf "${AUR_BUILD_DIR}"
     log_success "${AUR_HELPER} installed."
   else
     log_success "AUR helper '${AUR_HELPER}' already present."
@@ -239,6 +296,15 @@ mkdir -p "${HOME}/.config/niri" \
          "${WALLPAPER_DIR}"
 log_success "Directories ready (wallpapers: ${WALLPAPER_DIR})."
 
+# Seed the wallpaper directory with the bundled images (never overwrites).
+WALLPAPER_SRC="${SCRIPT_DIR}/config/Wallpapers"
+if compgen -G "${WALLPAPER_SRC}/*" >/dev/null; then
+  cp -n "${WALLPAPER_SRC}"/* "${WALLPAPER_DIR}/"
+  log_success "Bundled wallpapers copied to ${WALLPAPER_DIR}"
+else
+  log_warn "No bundled wallpapers found in ${WALLPAPER_SRC}; skipping."
+fi
+
 # ------------------------------------------------------------------------------
 # Phase 4: niri configuration
 # ------------------------------------------------------------------------------
@@ -253,21 +319,26 @@ if [[ ! -f "${NIRI_CONFIG_SRC}" ]]; then
   exit 1
 fi
 
+# Validate the bundled config BEFORE touching the user's existing one, so a
+# broken repo file never replaces a working config.
+if command -v niri &>/dev/null; then
+  if niri validate -c "${NIRI_CONFIG_SRC}" >/dev/null 2>&1; then
+    log_success "Bundled niri config validated."
+  else
+    log_error "Bundled niri config failed validation; not installing it:"
+    niri validate -c "${NIRI_CONFIG_SRC}" || true
+    exit 1
+  fi
+else
+  log_warn "niri binary not found; skipping config validation."
+fi
+
 if should_write_config "${NIRI_CONFIG}"; then
   # config/niri/config.kdl is niri's default config with the tutorial's changes
   # applied, plus Noctalia's recommended niri integration. Edit that file in the
   # repo to change the defaults; niri reloads the installed copy on save.
   install -m 0644 "${NIRI_CONFIG_SRC}" "${NIRI_CONFIG}"
   log_success "Installed ${NIRI_CONFIG_SRC} -> ${NIRI_CONFIG}"
-
-  if command -v niri &>/dev/null; then
-    if niri validate -c "${NIRI_CONFIG}" >/dev/null 2>&1; then
-      log_success "niri config validated."
-    else
-      log_warn "niri reported a problem with the installed config:"
-      niri validate -c "${NIRI_CONFIG}" || true
-    fi
-  fi
 fi
 
 # ------------------------------------------------------------------------------
@@ -290,9 +361,9 @@ if should_write_config "${NOCTALIA_CONFIG}"; then
   # placeholders which are filled from the variables at the top of this script.
   install -m 0644 "${NOCTALIA_CONFIG_SRC}" "${NOCTALIA_CONFIG}"
   sed -i \
-    -e "s|__UI_FONT__|${UI_FONT}|g" \
-    -e "s|__THEME__|${NOCTALIA_THEME}|g" \
-    -e "s|__WALLPAPER_DIR__|${WALLPAPER_DIR}|g" \
+    -e "s|__UI_FONT__|$(escape_sed "${UI_FONT}")|g" \
+    -e "s|__THEME__|$(escape_sed "${NOCTALIA_THEME}")|g" \
+    -e "s|__WALLPAPER_DIR__|$(escape_sed "${WALLPAPER_DIR}")|g" \
     "${NOCTALIA_CONFIG}"
   log_success "Installed ${NOCTALIA_CONFIG_SRC} -> ${NOCTALIA_CONFIG}"
 fi
@@ -315,7 +386,7 @@ if should_write_config "${ALACRITTY_CONFIG}"; then
   # config/alacritty/alacritty.toml contains a __MONO_FONT__ placeholder which
   # is filled from the MONO_FONT variable at the top of this script.
   install -m 0644 "${ALACRITTY_CONFIG_SRC}" "${ALACRITTY_CONFIG}"
-  sed -i -e "s|__MONO_FONT__|${MONO_FONT}|g" "${ALACRITTY_CONFIG}"
+  sed -i -e "s|__MONO_FONT__|$(escape_sed "${MONO_FONT}")|g" "${ALACRITTY_CONFIG}"
   log_success "Installed ${ALACRITTY_CONFIG_SRC} -> ${ALACRITTY_CONFIG}"
 fi
 
@@ -328,6 +399,13 @@ BASH_PROFILE="${HOME}/.bash_profile"
 AUTOSTART_MARKER="# >>> niriInstall.sh: start niri on TTY1 >>>"
 
 if resolve_choice "${AUTOSTART_NIRI}" "Start niri automatically when you log in on TTY1?" "y"; then
+  LOGIN_SHELL="$(basename "${SHELL:-}")"
+  if [[ "${LOGIN_SHELL}" != "bash" ]]; then
+    log_warn "Your login shell is '${LOGIN_SHELL:-unknown}', not bash. ~/.bash_profile will NOT be read at login,"
+    log_warn "so the TTY1 autostart below will have no effect. Port the snippet to your shell's login file"
+    log_warn "(e.g. ~/.zprofile or ~/.config/fish/config.fish) or switch to bash: chsh -s /bin/bash"
+  fi
+
   if [[ -f "${BASH_PROFILE}" ]] && grep -qF "${AUTOSTART_MARKER}" "${BASH_PROFILE}"; then
     log_info "TTY1 autostart already present in ${BASH_PROFILE}"
   else
@@ -335,15 +413,20 @@ if resolve_choice "${AUTOSTART_NIRI}" "Start niri automatically when you log in 
     if [[ ! -f "${BASH_PROFILE}" ]]; then
       printf '[[ -f ~/.bashrc ]] && . ~/.bashrc\n\n' > "${BASH_PROFILE}"
     fi
+    # XDG_VTNR is set by pam_systemd/logind; avoids forking $(tty).
+    # ~/.no-niri-autostart is an escape hatch: if niri fails to start you would
+    # otherwise be stuck in a login -> exec niri -> crash -> login loop on TTY1.
     cat >> "${BASH_PROFILE}" <<'PROFILE_EOF'
 
 # >>> niriInstall.sh: start niri on TTY1 >>>
-if [[ -z "${WAYLAND_DISPLAY:-}" && "$(tty)" == "/dev/tty1" ]]; then
+# To disable temporarily (e.g. niri crashes at login): touch ~/.no-niri-autostart
+if [[ -z "${WAYLAND_DISPLAY:-}" && "${XDG_VTNR:-}" == "1" && ! -e ~/.no-niri-autostart ]]; then
   exec niri-session
 fi
 # <<< niriInstall.sh <<<
 PROFILE_EOF
     log_success "TTY1 autostart added to ${BASH_PROFILE}"
+    log_info "Escape hatch: 'touch ~/.no-niri-autostart' from another TTY disables autostart."
   fi
 else
   log_info "Skipping autostart. Start niri manually with: niri-session"
@@ -355,17 +438,26 @@ fi
 log_title "Phase 8: Done"
 
 echo
-echo -e "${COLOR_SUCCESS}========================================================================${COLOR_RESET}"
-echo -e "${COLOR_SUCCESS}                 Niri Desktop Setup Completed Successfully!             ${COLOR_RESET}"
-echo -e "${COLOR_SUCCESS}========================================================================${COLOR_RESET}"
+printf '%s%s%s\n' "${COLOR_SUCCESS}" "========================================================================" "${COLOR_RESET}"
+printf '%s%s%s\n' "${COLOR_SUCCESS}" "                 Niri Desktop Setup Completed Successfully!             " "${COLOR_RESET}"
+printf '%s%s%s\n' "${COLOR_SUCCESS}" "========================================================================" "${COLOR_RESET}"
 echo
+# pkg_ver <name> -> "name 1.2.3-1" or "name (not installed)"
+pkg_ver() { pacman -Q "$1" 2>/dev/null || echo "$1 (not installed)"; }
+
 echo "Installed:"
-echo "  - niri + xwayland-satellite      (compositor)"
-echo "  - noctalia                       (bar / launcher / notifications / lock / wallpaper)"
+echo "  - $(pkg_ver niri) + xwayland-satellite   (compositor)"
+echo "  - $(pkg_ver noctalia)                    (bar / launcher / notifications / lock / wallpaper)"
 echo "  - alacritty, swaybg"
-[[ "${INSTALL_BROWSER}" =~ ^[Yy] ]] && echo "  - ${BROWSER_PKG} (AUR, via ${AUR_HELPER})"
+[[ "${INSTALL_BROWSER}" == "yes" ]] && echo "  - $(pkg_ver "${BROWSER_PKG}") (AUR, via ${AUR_HELPER})"
 echo "  - JetBrainsMono Nerd Font, Noto fonts, xdg-desktop-portal (gnome/gtk)"
-[[ "${IS_LAPTOP}" == "yes" ]] && echo "  - brightnessctl, upower, power-profiles-daemon (laptop)"
+if [[ "${IS_LAPTOP}" == "yes" ]]; then
+  if [[ "${INSTALL_PPD}" == "yes" ]]; then
+    echo "  - brightnessctl, upower, power-profiles-daemon (laptop)"
+  else
+    echo "  - brightnessctl, upower (laptop; power-profiles-daemon skipped due to tlp/auto-cpufreq)"
+  fi
+fi
 echo
 echo "Config files:"
 echo "  - ${NIRI_CONFIG}"
@@ -383,7 +475,7 @@ echo "  Super+Alt+L          Lock                Mod+Shift+E    Quit niri"
 echo "  Mod+Shift+/          Show all hotkeys"
 echo
 echo "Next Steps:"
-echo "  1. Put some wallpapers in: ${WALLPAPER_DIR}"
+echo "  1. Add your own wallpapers to: ${WALLPAPER_DIR} (a few are bundled already)"
 echo "  2. Start niri: log out and back in on TTY1 (if autostart enabled), or run: niri-session"
 echo "  3. Multi-monitor? Run 'niri msg outputs' and edit the output block in config.kdl."
 echo "  4. Noctalia settings UI: Mod+N -> gear icon, or run: noctalia msg settings-toggle"
