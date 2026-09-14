@@ -13,28 +13,45 @@
 #      recent Intel laptops (this ThinkPad included — confirmed on its
 #      ArchWiki page) use a cAVS/SOF audio DSP and produce NO sound without
 #      it, regardless of which HDA codec is present. This script installs
-#      sof-firmware + alsa-ucm-conf + alsa-utils + pipewire/pipewire-pulse/
-#      wireplumber, and globally enables the PipeWire user services so audio
-#      works after first boot without any manual `systemctl --user` step.
+#      sof-firmware + the full PipeWire stack (pipewire, pipewire-audio,
+#      pipewire-alsa, pipewire-pulse, wireplumber, rtkit) + alsa-utils, and
+#      globally enables the PipeWire user units so audio works after first
+#      boot without any manual `systemctl --user` step.
 #
 #   2. GRAPHICS: mesa + vulkan-intel + intel-media-driver are now installed
 #      unconditionally for the Iris Xe (or any Gen8+ Intel) iGPU, instead of
 #      being left out entirely as in the generic minimal script.
 #
+#   3. LAPTOP / WAYLAND BASE: this script is intended as the foundation for a
+#      Wayland compositor install, so it also ships the compositor-agnostic
+#      pieces such a session needs on this hardware: polkit, Bluetooth,
+#      power-profiles-daemon, thermald, iio-sensor-proxy, fprintd,
+#      brightnessctl, a baseline font set, and base-devel/git for AUR builds.
+#      The compositor itself, login manager, portals and Qt/XWayland shims are
+#      deliberately left to a post-install step.
+#
 # Vendor auto-detection for AMD CPUs/GPUs and Wi-Fi vendors other than
 # Intel/Realtek has been removed on purpose — this script assumes an Intel
 # platform. Use archInstallMinimal.sh if you need broader hardware coverage.
 #
+# Not configured (by design): disk encryption, hibernation (swap is overflow
+# only), a display/login manager.
+#
 # Every default in the "Configuration" section can be overridden from the
 # environment, e.g.:  KEYMAP=de-latin1 SWAP_SIZE=8G ./archInstallMinimalIntel.sh
 #
-# Firmware overrides:
+# Other overrides:
+#   USER_SHELL=zsh                  login shell for the regular user (package
+#                                   name == binary name; default bash)
 #   FULL_FIRMWARE=1                 install the full linux-firmware meta package
 #                                   instead of the detected subset
 #   EXTRA_FIRMWARE="pkg1 pkg2"      append firmware packages to the detected set
 # ==============================================================================
 
-set -euo pipefail
+# -E (errtrace) is required so the ERR trap below also fires for failures
+# inside functions and subshells; without it, `set -e` still exits but the
+# cleanup handler is skipped.
+set -Eeuo pipefail
 
 # ------------------------------------------------------------------------------
 # Configuration (override via environment)
@@ -44,11 +61,17 @@ LOCALE="${LOCALE:-en_US.UTF-8}"
 KEYMAP="${KEYMAP:-us}"
 DEFAULT_HOSTNAME="${DEFAULT_HOSTNAME:-archlinux}"
 EFI_SIZE="${EFI_SIZE:-1G}"
+# SWAP_SIZE is sized for memory overflow only. Hibernation is NOT configured:
+# no `resume` initramfs hook and no `resume=` kernel parameter are set up, and
+# 4G is far smaller than RAM on the target hardware. Suspend-to-RAM works.
 SWAP_SIZE="${SWAP_SIZE:-4G}"
 BOOTLOADER_ID="${BOOTLOADER_ID:-GRUB}"
 KERNEL="${KERNEL:-linux-zen}"
 FULL_FIRMWARE="${FULL_FIRMWARE:-0}"
 EXTRA_FIRMWARE="${EXTRA_FIRMWARE:-}"
+# Login shell for the regular user. Must be both a package name and the name of
+# the binary it installs (bash, zsh, fish, dash, ...). bash ships with `base`.
+USER_SHELL="${USER_SHELL:-bash}"
 
 # ------------------------------------------------------------------------------
 # Logging
@@ -69,21 +92,29 @@ log_title()   { echo -e "\n${COLOR_TITLE}=== $* ===${COLOR_RESET}"; }
 # ------------------------------------------------------------------------------
 # Error Handling
 # ------------------------------------------------------------------------------
-# On any failure: report the line, unmount whatever is under /mnt, disable
-# swap, and exit with the original status.
-cleanup_on_err() {
+# The ERR trap only records where the failure happened; the EXIT trap does the
+# actual cleanup. Splitting them this way means cleanup also runs for explicit
+# `exit 1` calls (which do not trigger ERR), while a successful run (exit 0)
+# leaves everything alone.
+ERR_LINE=""
+trap 'ERR_LINE=$LINENO' ERR
+
+cleanup_on_exit() {
   local exit_code=$?
   if [[ $exit_code -ne 0 ]]; then
-    log_error "Installation failed on line $1 with exit code $exit_code."
+    if [[ -n "${ERR_LINE}" ]]; then
+      log_error "Installation failed on line ${ERR_LINE} with exit code ${exit_code}."
+    else
+      log_error "Installation aborted with exit code ${exit_code}."
+    fi
     if mountpoint -q /mnt 2>/dev/null; then
       log_warn "Unmounting filesystems under /mnt..."
       umount -R /mnt 2>/dev/null || log_warn "Could not fully unmount /mnt; run manually: umount -R /mnt"
     fi
     swapoff -a 2>/dev/null || true
   fi
-  exit "$exit_code"
 }
-trap 'cleanup_on_err $LINENO' ERR
+trap cleanup_on_exit EXIT
 
 # ------------------------------------------------------------------------------
 # Helper Functions
@@ -118,10 +149,12 @@ check_internet() {
 prompt_secure_password() {
   local prompt_label="$1"
   local pass1 pass2
+  # IFS= prevents read from trimming leading/trailing whitespace, which would
+  # otherwise silently alter passwords like " secret ".
   while true; do
-    read -rsp "Enter ${prompt_label} password: " pass1
+    IFS= read -rsp "Enter ${prompt_label} password: " pass1
     echo >&2
-    read -rsp "Confirm ${prompt_label} password: " pass2
+    IFS= read -rsp "Confirm ${prompt_label} password: " pass2
     echo >&2
     if [[ -z "${pass1}" ]]; then
       log_warn "Password cannot be empty. Please try again." >&2
@@ -206,14 +239,21 @@ if [[ "${UEFI_BITNESS}" != "64" ]]; then
 fi
 log_success "64-bit UEFI boot mode verified."
 
-# 3. Console keymap (live session only; persisted to the target in Phase 6)
+# 3. Login shell name sanity check (the package itself is verified by pacstrap)
+if [[ ! "${USER_SHELL}" =~ ^[a-z][a-z0-9_.-]*$ ]]; then
+  log_error "Invalid USER_SHELL '${USER_SHELL}'. Expected a plain package/binary name such as bash, zsh or fish."
+  exit 1
+fi
+log_info "User login shell: ${USER_SHELL}"
+
+# 4. Console keymap (live session only; persisted to the target in Phase 6)
 log_info "Applying keymap: ${KEYMAP}"
 loadkeys "${KEYMAP}" 2>/dev/null || log_warn "Could not load keymap '${KEYMAP}', continuing with system default."
 
-# 4. Internet connectivity
+# 5. Internet connectivity
 check_internet
 
-# 5. System clock
+# 6. System clock
 #    An accurate clock avoids package signature and TLS failures during
 #    pacstrap, so wait briefly (up to 15 s) for NTP to report sync.
 log_info "Synchronizing system clock via NTP..."
@@ -232,7 +272,7 @@ else
   log_warn "NTP did not report synchronization within 15s. Continuing; package signature checks may fail if the clock is badly off."
 fi
 
-# 6. Pacman mirrors (best-effort; falls back to the ISO default list)
+# 7. Pacman mirrors (best-effort; falls back to the ISO default list)
 if command -v reflector &>/dev/null; then
   log_info "Ranking pacman mirrors with reflector (this may take a moment)..."
   if reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist 2>/dev/null; then
@@ -460,6 +500,9 @@ else
   FIRMWARE_PACKAGES+=(linux-firmware-intel)
 
   # Realtek Wi-Fi/BT combo (rtw88/rtw89), if present instead of Intel's.
+  # Note: PCI vendor 10ec also matches Realtek Ethernet NICs (r8169), which
+  # pull this package in on more machines than just Realtek Wi-Fi SKUs. That
+  # is harmless — r8169 loads its rtl_nic firmware from the same package.
   if has_vendor "${PCI_VENDORS}" 10ec || has_vendor "${USB_VENDORS}" 0bda; then
     FIRMWARE_PACKAGES+=(linux-firmware-realtek)
     log_info "Realtek device detected; adding linux-firmware-realtek."
@@ -492,19 +535,65 @@ fi
 #    firmware detection never installed sof-firmware. This ThinkPad's own
 #    ArchWiki page states it requires Sound Open Firmware for the soundcard
 #    to work at all — the HDA codec alone is not enough on cAVS/SOF
-#    platforms. alsa-ucm-conf supplies the UCM profile (sof-hda-dsp) that
-#    PipeWire/WirePlumber use to route the speakers and microphone.
-AUDIO_PACKAGES=(sof-firmware alsa-ucm-conf alsa-utils pipewire pipewire-pulse wireplumber)
+#    platforms.
+#
+#    Package roles (validated against the Arch package database):
+#      sof-firmware    DSP firmware. Nothing depends on it, so it MUST be listed.
+#      pipewire        The daemon only. Audio support is an *optdepend*, hence:
+#      pipewire-audio  ALSA/Bluetooth SPA plugins — without this PipeWire has no
+#                      audio at all. Listed explicitly rather than relying on it
+#                      arriving transitively via pipewire-pulse.
+#      pipewire-alsa   Routes pure-ALSA clients through PipeWire instead of
+#                      letting them grab the hardware device directly.
+#      pipewire-pulse  PulseAudio API for browsers and most desktop apps.
+#      wireplumber     Session manager. Listed explicitly so pacstrap never has
+#                      to prompt for a 'pipewire-session-manager' provider.
+#      rtkit           Realtime scheduling for the PipeWire threads (fewer
+#                      xruns under load). Optional for sound to work at all.
+#      alsa-utils      Not required for sound; provides alsamixer/amixer/
+#                      speaker-test used in the post-install checks below.
+#
+#    alsa-ucm-conf (the sof-hda-dsp UCM profile) is NOT listed: alsa-lib hard-
+#    depends on it, and pipewire-audio depends on alsa-lib, so it is always
+#    installed anyway.
+AUDIO_PACKAGES=(sof-firmware pipewire pipewire-audio pipewire-alsa pipewire-pulse wireplumber rtkit alsa-utils)
 
-# 5. Package list
+# 5. Laptop platform services & desktop prerequisites
+#    Compositor-agnostic pieces a Wayland session on this hardware needs, so
+#    the compositor itself can be layered on afterwards. Daemons are enabled
+#    in the chroot step; fprintd and iio-sensor-proxy are D-Bus activated.
+LAPTOP_PACKAGES=(
+  # polkit is only an *optdepend* of networkmanager ("let non-root users
+  # control networking") — without it nmcli/nmtui fail for the regular user,
+  # and every Wayland session needs a polkit authority anyway.
+  polkit
+
+  bluez bluez-utils         # Bluetooth stack (PipeWire BT plugins need bluetoothd)
+  power-profiles-daemon     # Platform power profiles (Fn+H/L/M on this ThinkPad)
+  thermald                  # Intel thermal management
+  iio-sensor-proxy          # Rotation sensor (X1 Yoga)
+  fprintd                   # Fingerprint reader (Synaptics 06cb:00fc via libfprint)
+  brightnessctl             # Backlight control for compositor keybinds
+
+  # Fonts: without at least one font every Wayland client renders tofu.
+  noto-fonts noto-fonts-emoji ttf-dejavu
+)
+
+# 6. Package list
 BASE_PACKAGES=(
   # Core system
   base
   "${KERNEL}"
 
-  # Privilege escalation (base-devel is intentionally omitted; sudo is the
-  # only piece of it this install relies on)
-  sudo
+  # Build tooling — required for makepkg / AUR (the compositor build-out
+  # will need it). base-devel includes sudo.
+  base-devel
+  git
+
+  # Documentation & pacman helpers
+  man-db
+  man-pages
+  pacman-contrib
 
   # Filesystem tools (fsck for ext4 / FAT32)
   e2fsprogs
@@ -521,19 +610,34 @@ BASE_PACKAGES=(
 if [[ -n "${CPU_UCODE}" ]]; then
   BASE_PACKAGES+=("${CPU_UCODE}")
 fi
+# bash is already provided by `base`; anything else must be installed.
+if [[ "${USER_SHELL}" != "bash" ]]; then
+  BASE_PACKAGES+=("${USER_SHELL}")
+fi
 BASE_PACKAGES+=("${FIRMWARE_PACKAGES[@]}")
 BASE_PACKAGES+=("${GPU_PACKAGES[@]}")
 BASE_PACKAGES+=("${AUDIO_PACKAGES[@]}")
+BASE_PACKAGES+=("${LAPTOP_PACKAGES[@]}")
 
 log_info "Packages to be installed via pacstrap:"
 printf '  - %s\n' "${BASE_PACKAGES[@]}"
 
-# 6. Install
+# 7. Install
 log_info "Running pacstrap on /mnt (this may take a few minutes)..."
 pacstrap -K /mnt "${BASE_PACKAGES[@]}"
 log_success "Base system packages installed successfully."
 
-# 7. fstab
+# 8. Target pacman.conf: coloured output and parallel downloads. The live ISO
+#    already enables these for pacstrap, but the installed system's config is
+#    stock. The sed patterns only touch the commented-out defaults, so a
+#    future pacman.conf that ships them enabled is left untouched.
+log_info "Enabling Color and ParallelDownloads in the target pacman.conf..."
+sed -i \
+  -e 's/^#Color$/Color/' \
+  -e 's/^#ParallelDownloads = .*/ParallelDownloads = 5/' \
+  /mnt/etc/pacman.conf
+
+# 9. fstab
 log_info "Generating fstab using persistent UUIDs..."
 genfstab -U /mnt >> /mnt/etc/fstab
 log_success "fstab generated. Contents:"
@@ -583,7 +687,19 @@ cat <<HOSTS_EOF > /etc/hosts
 HOSTS_EOF
 
 # 5. User account & sudo (wheel group via a drop-in, not /etc/sudoers)
-useradd -m -G wheel -s /bin/bash "${USERNAME}"
+#    Resolve the login shell inside the chroot so we get the real path the
+#    package installed (e.g. /usr/bin/zsh) and can confirm it is registered in
+#    /etc/shells before handing it to useradd.
+USER_SHELL_PATH=$(command -v "${USER_SHELL}" || true)
+if [[ -z "${USER_SHELL_PATH}" ]]; then
+  echo "[ERROR] Login shell '${USER_SHELL}' not found in the installed system." >&2
+  exit 1
+fi
+if ! grep -qxF -- "${USER_SHELL_PATH}" /etc/shells; then
+  echo "[ERROR] '${USER_SHELL_PATH}' is not listed in /etc/shells." >&2
+  exit 1
+fi
+useradd -m -G wheel -s "${USER_SHELL_PATH}" "${USERNAME}"
 mkdir -p /etc/sudoers.d
 echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/10-wheel
 chmod 0440 /etc/sudoers.d/10-wheel
@@ -591,13 +707,18 @@ chmod 0440 /etc/sudoers.d/10-wheel
 # 6. Services
 systemctl enable NetworkManager
 systemctl enable systemd-timesyncd
+systemctl enable fstrim.timer             # weekly SSD TRIM (util-linux)
+systemctl enable bluetooth
+systemctl enable power-profiles-daemon
+systemctl enable thermald
 
 # 7. Audio services
-#    `--global` enables these user units for every user account without
-#    needing an active login session (arch-chroot has no running systemd, so
-#    a normal `systemctl --user enable` would fail here). This makes sure
-#    PipeWire/WirePlumber come up automatically on first login instead of
-#    requiring a manual `systemctl --user enable --now ...` afterwards.
+#    The Arch pipewire, pipewire-pulse and wireplumber packages already ship
+#    their user units pre-enabled via symlinks under
+#    /usr/lib/systemd/user/*.wants/, so this is normally a no-op. It is kept
+#    as a belt-and-braces guarantee in case packaging changes. `--global`
+#    enables user units for every account without an active login session
+#    (arch-chroot has no running systemd, so `systemctl --user` would fail).
 systemctl --global enable pipewire.socket pipewire-pulse.socket wireplumber.service
 
 # 8. GRUB bootloader
@@ -607,6 +728,13 @@ systemctl --global enable pipewire.socket pipewire-pulse.socket wireplumber.serv
 grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id="${BOOTLOADER_ID}" --recheck
 grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --recheck \
   || echo "[WARN] Fallback (--removable) GRUB install failed; primary NVRAM entry is still in place." >&2
+#    Single-boot install: os-prober is not installed, so tell grub-mkconfig
+#    not to look for it (silences the "os-prober will not be executed" warning).
+if grep -q '^#\?GRUB_DISABLE_OS_PROBER=' /etc/default/grub; then
+  sed -i 's/^#\?GRUB_DISABLE_OS_PROBER=.*/GRUB_DISABLE_OS_PROBER=true/' /etc/default/grub
+else
+  echo 'GRUB_DISABLE_OS_PROBER=true' >> /etc/default/grub
+fi
 grub-mkconfig -o /boot/grub/grub.cfg
 CHROOT_EOF
 )
@@ -617,6 +745,7 @@ arch-chroot /mnt /usr/bin/env \
   KEYMAP="${KEYMAP}" \
   TARGET_HOSTNAME="${TARGET_HOSTNAME}" \
   USERNAME="${USERNAME}" \
+  USER_SHELL="${USER_SHELL}" \
   BOOTLOADER_ID="${BOOTLOADER_ID}" \
   bash -euo pipefail -c "${CHROOT_SCRIPT}"
 
@@ -642,25 +771,31 @@ echo -e "${COLOR_SUCCESS}=======================================================
 echo
 echo "System Summary:"
 echo "  - Hostname : ${TARGET_HOSTNAME}"
-echo "  - User     : ${USERNAME} (member of wheel / sudo enabled)"
+echo "  - User     : ${USERNAME} (shell: ${USER_SHELL}, member of wheel / sudo enabled)"
 echo "  - Timezone : ${TIMEZONE}"
 echo "  - Locale   : ${LOCALE}"
 echo "  - Keymap   : ${KEYMAP}"
 echo "  - Kernel   : ${KERNEL}"
 echo "  - Boot     : GRUB UEFI (/boot/efi, with removable fallback)"
-echo "  - Network  : NetworkManager enabled"
-echo "  - Time     : systemd-timesyncd enabled"
+echo "  - Swap     : ${SWAP_SIZE} partition (overflow only; hibernation NOT configured)"
+echo "  - Services : NetworkManager, systemd-timesyncd, fstrim.timer, bluetooth,"
+echo "               power-profiles-daemon, thermald"
 echo "  - Graphics : mesa, vulkan-intel, intel-media-driver (Intel iGPU)"
-echo "  - Audio    : sof-firmware, alsa-ucm-conf, alsa-utils, PipeWire/WirePlumber (enabled)"
+echo "  - Audio    : ${AUDIO_PACKAGES[*]} (PipeWire user units enabled)"
+echo "  - Laptop   : ${LAPTOP_PACKAGES[*]}"
 echo "  - Firmware : ${FIRMWARE_PACKAGES[*]}"
+echo "  - Pacman   : Color + ParallelDownloads enabled"
 echo
 echo "Not installed (add in a post-install step as needed):"
-echo "  - Devel    : base-devel (needed for makepkg / AUR)"
 echo "  - Editor   : nano or vim"
+echo "  - Wayland  : your compositor, a login manager (e.g. greetd), xorg-xwayland,"
+echo "               qt5/qt6-wayland, xdg-desktop-portal + backend, a polkit agent"
 echo
 echo "After first login, verify audio with:"
-echo "  wpctl status        # confirm PipeWire sees the sink"
+echo "  wpctl status         # confirm PipeWire sees the sink"
+echo "  speaker-test -c 2    # should play through PipeWire (pipewire-alsa)"
 echo "  alsamixer            # press F6, select 'sof-hda-dsp', ensure Master/Speaker are unmuted"
+echo "  journalctl -b | grep -i sof   # must NOT show 'sof firmware file is missing'"
 echo
 echo "This model also has a rotation sensor, IR camera, and webcam covered on its"
 echo "ArchWiki page (Lenovo ThinkPad X1 Yoga (Gen 6)) if you install a DE later."
