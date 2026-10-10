@@ -13,6 +13,9 @@
 #   - alacritty, swaybg, JetBrainsMono Nerd Font, Noto fonts
 #   - Helium browser (AUR: helium-browser-bin) via yay, bootstrapped if missing,
 #     and registered as the default browser for http/https/html
+#   - Login screen: greetd + Noctalia Greeter (AUR: noctalia-greeter);
+#     /etc/greetd/config.toml pointed at noctalia-greeter-session, any other
+#     display manager disabled, greetd enabled for the next boot
 #   - xdg-desktop-portal (gnome + gtk) for screen sharing / file pickers
 #   - Desktop basics: nautilus (files), imv (images), pavucontrol (audio mixer)
 #   - Wayland plumbing: qt5-wayland, qt6-wayland, adwaita-icon-theme (GTK icons
@@ -28,12 +31,12 @@
 # Not done here (by design):
 #   - Login shell (zsh + starship, ~/.zshrc, ~/.config/starship.toml) is set up
 #     by archInstall.sh; this script is desktop-only.
-#   - Auto-starting niri on TTY1 is left to you. Start it with `niri-session`,
-#     or add to ~/.zprofile:
-#       [[ -z "$WAYLAND_DISPLAY" && "$XDG_VTNR" == 1 ]] && exec niri-session
+#   - greetd is enabled but NOT started, so the current TTY session survives;
+#     the greeter appears after a reboot. With INSTALL_GREETER=no, start niri
+#     yourself with `niri-session` (or exec it from ~/.zprofile on TTY1).
 #
 # Every default in the "Configuration" section can be overridden from the
-# environment, e.g.:  INSTALL_BROWSER=no OVERWRITE_CONFIGS=yes ./niriInstall.sh
+# environment, e.g.:  INSTALL_BROWSER=no INSTALL_GREETER=no ./niriInstall.sh
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -46,6 +49,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ------------------------------------------------------------------------------
 INSTALL_BROWSER="${INSTALL_BROWSER:-yes}"        # yes|no  (Helium browser from the AUR)
 BROWSER_PKG="${BROWSER_PKG:-helium-browser-bin}" # AUR package name
+INSTALL_GREETER="${INSTALL_GREETER:-yes}"        # yes|no  (greetd + Noctalia Greeter login screen)
+GREETER_PKG="${GREETER_PKG:-noctalia-greeter}"   # AUR package name (noctalia-greeter | noctalia-greeter-git)
 AUR_HELPER="${AUR_HELPER:-yay}"                  # yay|paru (bootstrapped from the AUR if missing)
 OVERWRITE_CONFIGS="${OVERWRITE_CONFIGS:-ask}"    # yes|no|ask  (replace existing niri/noctalia/alacritty configs; backups are made)
 LINK_CONFIGS="${LINK_CONFIGS:-no}"               # yes|no  (symlink placeholder-free configs to this repo instead of copying;
@@ -211,6 +216,7 @@ validate_option() {
   printf -v "${name}" '%s' "${value}"
 }
 validate_option INSTALL_BROWSER   "yes no"
+validate_option INSTALL_GREETER   "yes no"
 validate_option OVERWRITE_CONFIGS "yes no ask"
 validate_option LINK_CONFIGS      "yes no"
 validate_option AUR_HELPER        "yay paru"
@@ -344,6 +350,10 @@ AUR_PACKAGES=()
 if [[ "${INSTALL_BROWSER}" == "yes" ]]; then
   AUR_PACKAGES+=("${BROWSER_PKG}")
 fi
+if [[ "${INSTALL_GREETER}" == "yes" ]]; then
+  PACKAGES+=(greetd)                 # official repo; the greeter itself is AUR
+  AUR_PACKAGES+=("${GREETER_PKG}")
+fi
 
 # power-profiles-daemon conflicts with tlp / auto-cpufreq; skip it if either is present.
 INSTALL_PPD="no"
@@ -380,7 +390,7 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# Phase 2b: AUR packages (Helium browser)
+# Phase 2b: AUR packages (Helium browser, Noctalia Greeter)
 # ------------------------------------------------------------------------------
 BROWSER_DESKTOP=""
 if [[ ${#AUR_PACKAGES[@]} -gt 0 ]]; then
@@ -417,6 +427,57 @@ if [[ ${#AUR_PACKAGES[@]} -gt 0 ]]; then
       log_warn "No .desktop file found in ${BROWSER_PKG}; default browser not set."
     fi
   fi
+fi
+
+# ------------------------------------------------------------------------------
+# Phase 2c: Login screen (greetd + Noctalia Greeter)
+# ------------------------------------------------------------------------------
+GREETD_STATUS="not installed"
+if [[ "${INSTALL_GREETER}" == "yes" ]]; then
+  log_title "Phase 2c: Login Screen (greetd)"
+
+  GREETD_CONF="/etc/greetd/config.toml"
+  # greetd must launch the session wrapper, not the noctalia-greeter binary.
+  GREETER_SESSION="$(command -v noctalia-greeter-session || true)"
+  if [[ -z "${GREETER_SESSION}" ]]; then
+    log_error "noctalia-greeter-session not found after installing ${GREETER_PKG}; cannot configure greetd."
+    exit 1
+  fi
+
+  # Point greetd's [default_session] at the greeter. Only the `command` line
+  # inside that section is touched (the range stops at the next [section]), so
+  # the rest of the packaged config - vt, greeter user - is preserved.
+  if [[ ! -f "${GREETD_CONF}" ]]; then
+    log_error "${GREETD_CONF} not found; is greetd installed?"
+    exit 1
+  fi
+  if sudo grep -qF "command = \"${GREETER_SESSION}\"" "${GREETD_CONF}"; then
+    log_info "${GREETD_CONF} already launches ${GREETER_SESSION}"
+  else
+    sudo cp -a "${GREETD_CONF}" "${GREETD_CONF}.bak.$(date +%Y%m%d-%H%M%S)"
+    sudo sed -i "/^\[default_session\]/,/^\[/ s|^command = .*|command = \"${GREETER_SESSION}\"|" "${GREETD_CONF}"
+    if sudo grep -qF "command = \"${GREETER_SESSION}\"" "${GREETD_CONF}"; then
+      log_success "${GREETD_CONF}: default_session command -> ${GREETER_SESSION}"
+    else
+      log_error "Failed to update ${GREETD_CONF}; edit it manually (see the .bak copy next to it)."
+      exit 1
+    fi
+  fi
+
+  # Exactly one display manager may own display-manager.service. Disable any
+  # other one (gdm, sddm, ly, ...) before enabling greetd.
+  CURRENT_DM="$(systemctl show -p Id --value display-manager.service 2>/dev/null || true)"
+  if [[ -n "${CURRENT_DM}" && "${CURRENT_DM}" != "display-manager.service" && "${CURRENT_DM}" != "greetd.service" ]]; then
+    log_warn "Another display manager is enabled (${CURRENT_DM}); disabling it in favour of greetd."
+    sudo systemctl disable "${CURRENT_DM}" 2>/dev/null \
+      || log_warn "Could not disable ${CURRENT_DM}; disable it manually before rebooting."
+  fi
+
+  # enable, not --now: starting greetd here would take over VT1 and kill the
+  # TTY session this script is running from. It comes up on the next boot.
+  sudo systemctl enable greetd.service
+  GREETD_STATUS="enabled (starts on next boot)"
+  log_success "greetd enabled. Noctalia Greeter will appear after a reboot."
 fi
 
 # ------------------------------------------------------------------------------
@@ -482,6 +543,9 @@ echo "  - alacritty, swaybg, nautilus, imv, pavucontrol"
 if [[ "${INSTALL_BROWSER}" == "yes" ]]; then
   echo "  - $(pkg_ver "${BROWSER_PKG}") (AUR, via ${AUR_HELPER}; default browser: ${BROWSER_DESKTOP:-not set})"
 fi
+if [[ "${INSTALL_GREETER}" == "yes" ]]; then
+  echo "  - $(pkg_ver greetd) + $(pkg_ver "${GREETER_PKG}") (login screen; ${GREETD_STATUS})"
+fi
 echo "  - JetBrainsMono Nerd Font, Noto fonts, adwaita-icon-theme, qt5/qt6-wayland"
 echo "  - xdg-desktop-portal (gnome/gtk)"
 if [[ "${IS_LAPTOP}" == "yes" ]]; then
@@ -505,9 +569,15 @@ echo "  Super+Alt+L  Lock                  Mod+Shift+E  Quit niri"
 echo
 echo "Next Steps:"
 echo "  1. Add your own wallpapers to: ${WALLPAPER_DIR} (a few are bundled already)"
-echo "  2. Start niri from a TTY with: niri-session"
-echo "     (to auto-start on TTY1, add to ~/.zprofile:"
-echo "      [[ -z \"\$WAYLAND_DISPLAY\" && \"\$XDG_VTNR\" == 1 ]] && exec niri-session)"
+if [[ "${INSTALL_GREETER}" == "yes" ]]; then
+  echo "  2. Reboot: greetd shows the Noctalia Greeter; pick the 'niri' session and log in."
+  echo "     If the greeter fails, switch to TTY2 (Ctrl+Alt+F2), log in, and run:"
+  echo "       sudo systemctl disable greetd   # then start niri manually with: niri-session"
+else
+  echo "  2. Start niri from a TTY with: niri-session"
+  echo "     (to auto-start on TTY1, add to ~/.zprofile:"
+  echo "      [[ -z \"\$WAYLAND_DISPLAY\" && \"\$XDG_VTNR\" == 1 ]] && exec niri-session)"
+fi
 echo "  3. Multi-monitor? Run 'niri msg outputs' and edit the output block in config.kdl."
 echo "  4. Noctalia settings UI: Mod+N -> gear icon, or run: noctalia msg settings-toggle"
 echo "     Idle lock is on (10 min lock, 11 min screen off): [idle.behavior.*] in config.toml"
