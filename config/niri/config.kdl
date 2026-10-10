@@ -110,6 +110,25 @@ spawn-at-startup "noctalia"
 // ---------------------------------------------------------------------------
 // General & Environment
 // ---------------------------------------------------------------------------
+// Environment for everything niri spawns. DISPLAY for xwayland-satellite is
+// set by niri itself, so it is not listed here.
+environment {
+    // Chromium/Electron apps (Helium, VS Code, ...) run natively on Wayland
+    // instead of through XWayland.
+    ELECTRON_OZONE_PLATFORM_HINT "auto"
+    // Qt apps use the Wayland backend (needs qt5-wayland / qt6-wayland).
+    QT_QPA_PLATFORM "wayland"
+    // Firefox-based browsers use Wayland (default in recent versions; harmless).
+    MOZ_ENABLE_WAYLAND "1"
+}
+
+// Cursor theme/size for niri and for Wayland clients (via XCURSOR_* env).
+// Adwaita is provided by adwaita-icon-theme, installed by niriInstall.sh.
+cursor {
+    xcursor-theme "Adwaita"
+    xcursor-size 24
+}
+
 hotkey-overlay {
     // Uncomment this line to disable the "Important Hotkeys" pop-up at startup.
     // skip-at-startup

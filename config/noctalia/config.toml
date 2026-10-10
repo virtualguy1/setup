@@ -1,9 +1,10 @@
 # Noctalia configuration - installed to ~/.config/noctalia/config.toml by niriInstall.sh / umbrielInstall.sh
 #
-# Placeholders below are filled in by the script (override via environment):
-#   __UI_FONT__        <- UI_FONT        (default: JetBrainsMono Nerd Font Propo)
-#   __THEME__          <- NOCTALIA_THEME (default: Tokyo-Night)
-#   __WALLPAPER_DIR__  <- WALLPAPER_DIR  (default: ~/Pictures/Wallpapers)
+# Placeholder tokens (double-underscore UPPER_CASE) are filled in by the script
+# from these environment variables:
+#   UI_FONT        -> [shell] font_family     (default: JetBrainsMono Nerd Font Propo)
+#   NOCTALIA_THEME -> [theme] builtin         (default: Tokyo-Night)
+#   WALLPAPER_DIR  -> [wallpaper] directory   (default: ~/Pictures/Wallpapers)
 #
 # Only non-default values are set; everything else falls back to Noctalia's
 # defaults. Hot-reloads on save. Defaults reference:
@@ -45,3 +46,16 @@ order            = "random"
 # Umbriel: harmless; its overview blurs the wallpaper itself ([overview] background_blur).
 [backdrop]
 enabled = true
+
+# ── Idle (Noctalia's built-in idle manager; no swayidle needed) ──────────────
+# Lock after 10 minutes, turn the screen off 1 minute later. Off by default
+# upstream, so both are enabled explicitly here.
+[idle.behavior.lock]
+enabled = true
+timeout = 600
+action  = "lock"
+
+[idle.behavior.screen-off]
+enabled = true
+timeout = 660
+action  = "screen_off"

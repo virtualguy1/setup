@@ -8,22 +8,32 @@
 # Arch repos and Noctalia v5:
 #
 #   - niri (scrollable-tiling Wayland compositor) + xwayland-satellite
-#   - Noctalia (bar, launcher, notifications, lock screen, wallpaper, OSD)
-#   - alacritty, swaybg, JetBrainsMono Nerd Font
-#   - Helium browser (AUR: helium-browser-bin) via yay, bootstrapped if missing
+#   - Noctalia (bar, launcher, notifications, lock screen, idle lock, wallpaper,
+#     clipboard history, night light, OSD)
+#   - alacritty, swaybg, JetBrainsMono Nerd Font, Noto fonts
+#   - Helium browser (AUR: helium-browser-bin) via yay, bootstrapped if missing,
+#     and registered as the default browser for http/https/html
 #   - xdg-desktop-portal (gnome + gtk) for screen sharing / file pickers
-#   - ~/.config/niri/config.kdl  <- copied from ./config/niri/config.kdl
+#   - Desktop basics: nautilus (files), imv (images), pavucontrol (audio mixer)
+#   - Wayland plumbing: qt5-wayland, qt6-wayland, adwaita-icon-theme (GTK icons
+#     + Adwaita cursor, matched by the cursor block in config.kdl)
+#   - ~/.config/niri/config.kdl  <- ./config/niri/config.kdl
 #     (tutorial keybinds/look + Noctalia integration; edit that file to customise)
-#   - ~/.config/noctalia/config.toml  <- copied from ./config/noctalia/config.toml
+#   - ~/.config/noctalia/config.toml  <- ./config/noctalia/config.toml
 #     (tutorial bar layout & theme; font/theme/wallpaper dir filled from env vars)
-#   - ~/.config/alacritty/alacritty.toml  <- copied from ./config/alacritty/alacritty.toml
+#   - ~/.config/alacritty/alacritty.toml  <- ./config/alacritty/alacritty.toml
 #     (font filled from MONO_FONT)
 #   - $WALLPAPER_DIR seeded with the images in ./config/Wallpapers (never overwrites)
-#   - Optional: auto-start niri when logging in on TTY1
-#     (disable at any time with: touch ~/.no-niri-autostart)
+#
+# Not done here (by design):
+#   - Login shell (zsh + starship, ~/.zshrc, ~/.config/starship.toml) is set up
+#     by archInstall.sh; this script is desktop-only.
+#   - Auto-starting niri on TTY1 is left to you. Start it with `niri-session`,
+#     or add to ~/.zprofile:
+#       [[ -z "$WAYLAND_DISPLAY" && "$XDG_VTNR" == 1 ]] && exec niri-session
 #
 # Every default in the "Configuration" section can be overridden from the
-# environment, e.g.:  AUTOSTART_NIRI=no INSTALL_BROWSER=no ./niriInstall.sh
+# environment, e.g.:  INSTALL_BROWSER=no OVERWRITE_CONFIGS=yes ./niriInstall.sh
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -37,12 +47,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_BROWSER="${INSTALL_BROWSER:-yes}"        # yes|no  (Helium browser from the AUR)
 BROWSER_PKG="${BROWSER_PKG:-helium-browser-bin}" # AUR package name
 AUR_HELPER="${AUR_HELPER:-yay}"                  # yay|paru (bootstrapped from the AUR if missing)
-AUTOSTART_NIRI="${AUTOSTART_NIRI:-ask}"          # yes|no|ask  (start niri-session on TTY1 login)
 OVERWRITE_CONFIGS="${OVERWRITE_CONFIGS:-ask}"    # yes|no|ask  (replace existing niri/noctalia/alacritty configs; backups are made)
+LINK_CONFIGS="${LINK_CONFIGS:-no}"               # yes|no  (symlink placeholder-free configs to this repo instead of copying;
+                                                 #          niri hot-reloads on save, so edits in the repo apply live)
 WALLPAPER_DIR="${WALLPAPER_DIR:-${HOME}/Pictures/Wallpapers}"
-NOCTALIA_THEME="${NOCTALIA_THEME:-Tokyo-Night}"  # Ayu|Catppuccin|Dracula|Eldritch|Gruvbox|Kanagawa|Noctalia|Nord|Rosé Pine|Tokyo-Night
+NOCTALIA_THEME="${NOCTALIA_THEME:-Tokyo-Night}"  # see NOCTALIA_THEMES below
 UI_FONT="${UI_FONT:-JetBrainsMono Nerd Font Propo}"
 MONO_FONT="${MONO_FONT:-JetBrainsMono Nerd Font}"
+
+# Built-in Noctalia palettes (exact, case-sensitive names from example.toml).
+NOCTALIA_THEMES=("Ayu" "Catppuccin" "Dracula" "Eldritch" "Gruvbox" "Kanagawa" "Noctalia" "Nord" "Rosé Pine" "Tokyo-Night")
+
+# Bundled config files: "<repo-relative source>|<destination>".
+NIRI_CONFIG="${HOME}/.config/niri/config.kdl"
+NOCTALIA_CONFIG="${HOME}/.config/noctalia/config.toml"
+ALACRITTY_CONFIG="${HOME}/.config/alacritty/alacritty.toml"
+NIRI_CONFIG_SRC="${SCRIPT_DIR}/config/niri/config.kdl"
+NOCTALIA_CONFIG_SRC="${SCRIPT_DIR}/config/noctalia/config.toml"
+ALACRITTY_CONFIG_SRC="${SCRIPT_DIR}/config/alacritty/alacritty.toml"
+WALLPAPER_SRC="${SCRIPT_DIR}/config/Wallpapers"
 
 # ------------------------------------------------------------------------------
 # Logging
@@ -101,10 +124,10 @@ resolve_choice() {
   esac
 }
 
-# Move an existing file aside with a timestamp suffix.
+# Move an existing file (or symlink) aside with a timestamp suffix.
 backup_file() {
   local file="$1"
-  if [[ -e "${file}" ]]; then
+  if [[ -e "${file}" || -L "${file}" ]]; then
     local backup="${file}.bak.$(date +%Y%m%d-%H%M%S)"
     mv "${file}" "${backup}"
     log_warn "Existing $(basename "${file}") backed up to ${backup}"
@@ -112,6 +135,7 @@ backup_file() {
 }
 
 # Escape a string for use as a literal sed replacement (delimiter is '|').
+# Newlines cannot be escaped this way; they are rejected in Phase 1.
 escape_sed() {
   printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'
 }
@@ -119,8 +143,13 @@ escape_sed() {
 # Decide whether a config file should be (re)written.
 should_write_config() {
   local file="$1"
-  if [[ ! -e "${file}" ]]; then
+  if [[ ! -e "${file}" && ! -L "${file}" ]]; then
     return 0
+  fi
+  # Already the symlink we would create -> nothing to do.
+  if [[ -L "${file}" && -n "${2:-}" && "$(readlink -f "${file}")" == "$(readlink -f "$2")" ]]; then
+    log_info "${file} already links to the repo copy"
+    return 1
   fi
   if resolve_choice "${OVERWRITE_CONFIGS}" "Replace existing ${file}? (a backup will be kept)" "n"; then
     backup_file "${file}"
@@ -128,6 +157,41 @@ should_write_config() {
   fi
   log_info "Keeping existing ${file}"
   return 1
+}
+
+# install_config <src> <dst> [sed-expression ...]
+#
+# Copies <src> to <dst> (mode 0644) and applies the given sed expressions to
+# fill __PLACEHOLDER__ tokens, then asserts none are left. With LINK_CONFIGS=yes
+# and no sed expressions, symlinks <dst> -> <src> instead so edits in the repo
+# take effect immediately (niri hot-reloads its config on save).
+install_config() {
+  local src="$1" dst="$2"; shift 2
+  local -a sed_args=("$@")
+
+  if [[ "${LINK_CONFIGS}" == "yes" && ${#sed_args[@]} -eq 0 ]]; then
+    should_write_config "${dst}" "${src}" || return 0
+    mkdir -p "$(dirname "${dst}")"
+    ln -sfn "${src}" "${dst}"
+    log_success "Linked ${dst} -> ${src}"
+    return 0
+  fi
+  if [[ "${LINK_CONFIGS}" == "yes" ]]; then
+    log_info "$(basename "${dst}") contains placeholders; copying instead of linking."
+  fi
+
+  should_write_config "${dst}" || return 0
+  install -D -m 0644 "${src}" "${dst}"
+  if [[ ${#sed_args[@]} -gt 0 ]]; then
+    sed -i "${sed_args[@]}" "${dst}"
+  fi
+  # Guard against adding a placeholder to a template and forgetting its -e.
+  if grep -qE '__[A-Z_]+__' "${dst}"; then
+    log_error "Unfilled placeholder(s) in ${dst}:"
+    grep -nE '__[A-Z_]+__' "${dst}" >&2 || true
+    exit 1
+  fi
+  log_success "Installed ${src} -> ${dst}"
 }
 
 # ------------------------------------------------------------------------------
@@ -147,10 +211,38 @@ validate_option() {
   printf -v "${name}" '%s' "${value}"
 }
 validate_option INSTALL_BROWSER   "yes no"
-validate_option AUTOSTART_NIRI    "yes no ask"
 validate_option OVERWRITE_CONFIGS "yes no ask"
+validate_option LINK_CONFIGS      "yes no"
 validate_option AUR_HELPER        "yay paru"
+
+# NOCTALIA_THEME must match a built-in palette exactly (case-sensitive).
+theme_ok="no"
+for t in "${NOCTALIA_THEMES[@]}"; do
+  [[ "${NOCTALIA_THEME}" == "${t}" ]] && { theme_ok="yes"; break; }
+done
+if [[ "${theme_ok}" == "no" ]]; then
+  log_error "Invalid NOCTALIA_THEME='${NOCTALIA_THEME}'. Allowed values: $(printf '%s, ' "${NOCTALIA_THEMES[@]}" | sed 's/, $//')"
+  exit 1
+fi
+
+# Values substituted via sed must be single-line.
+for v in UI_FONT MONO_FONT WALLPAPER_DIR NOCTALIA_THEME; do
+  if [[ "${!v}" == *$'\n'* ]]; then
+    log_error "${v} must not contain a newline."
+    exit 1
+  fi
+done
 log_success "Configuration options valid."
+
+# Fail on a broken checkout now, not after a ten-minute package install.
+for src in "${NIRI_CONFIG_SRC}" "${NOCTALIA_CONFIG_SRC}" "${ALACRITTY_CONFIG_SRC}"; do
+  if [[ ! -f "${src}" ]]; then
+    log_error "Bundled config not found: ${src}"
+    log_error "Run this script from a full checkout of the repository."
+    exit 1
+  fi
+done
+log_success "Bundled config files present."
 
 if [[ "${EUID}" -eq 0 ]]; then
   log_error "Do not run this script as root. Run it as your normal user; it will call sudo when needed."
@@ -205,8 +297,12 @@ PACKAGES=(
   niri
   xwayland-satellite           # X11 app support; niri auto-launches it when installed
 
-  # Desktop shell (bar, launcher, notifications, lock screen, wallpaper, OSD)
+  # Desktop shell (bar, launcher, notifications, lock/idle, wallpaper, clipboard, OSD)
   noctalia
+  upower                       # noctalia optdep: battery / power device integration
+  # ddcutil is the remaining noctalia optdep (external-monitor brightness over
+  # DDC/CI). Not installed by default: needs the i2c-dev module and
+  # [brightness] enable_ddcutil = true in config.toml.
 
   # Tutorial extras
   alacritty                    # terminal
@@ -218,16 +314,28 @@ PACKAGES=(
   xdg-desktop-portal-gnome
   xdg-desktop-portal-gtk
 
+  # Desktop basics niri/Noctalia do not provide
+  nautilus                     # file manager (pairs with the gnome portal)
+  imv                          # image viewer
+  pavucontrol                  # audio mixer / PipeWire troubleshooting
+
+  # Wayland plumbing
+  qt5-wayland                  # Qt apps on Wayland (QT_QPA_PLATFORM=wayland in config.kdl)
+  qt6-wayland
+  adwaita-icon-theme           # GTK icons + Adwaita cursor (cursor block in config.kdl)
+
   # Quality of life
   wl-clipboard                 # wl-copy / wl-paste
   playerctl                    # media keys
   xdg-user-dirs                # creates ~/Pictures etc. (screenshots go there)
-  xdg-utils
+  xdg-utils                    # xdg-open / xdg-mime (default browser registration)
   noto-fonts
   noto-fonts-emoji
   polkit
 
-  # Build tooling (AUR helper bootstrap; generally useful on a desktop)
+  # Build tooling for the AUR helper bootstrap. Both are already installed by
+  # archInstall.sh; kept here (--needed makes them no-ops) so this script also
+  # works on systems installed some other way.
   git
   base-devel
 )
@@ -240,7 +348,7 @@ fi
 # power-profiles-daemon conflicts with tlp / auto-cpufreq; skip it if either is present.
 INSTALL_PPD="no"
 if [[ "${IS_LAPTOP}" == "yes" ]]; then
-  PACKAGES+=(brightnessctl upower)
+  PACKAGES+=(brightnessctl)
   if pacman -Qq tlp &>/dev/null || pacman -Qq auto-cpufreq &>/dev/null; then
     log_warn "tlp/auto-cpufreq detected; skipping power-profiles-daemon (they conflict)."
   else
@@ -261,9 +369,20 @@ if [[ "${INSTALL_PPD}" == "yes" ]]; then
     || log_warn "Could not enable power-profiles-daemon; continuing."
 fi
 
+# Validate the bundled niri config as soon as the binary exists and BEFORE any
+# user config is touched, so a broken repo file never replaces a working one.
+if niri validate -c "${NIRI_CONFIG_SRC}" >/dev/null 2>&1; then
+  log_success "Bundled niri config validated."
+else
+  log_error "Bundled niri config failed validation; aborting before touching any config:"
+  niri validate -c "${NIRI_CONFIG_SRC}" || true
+  exit 1
+fi
+
 # ------------------------------------------------------------------------------
 # Phase 2b: AUR packages (Helium browser)
 # ------------------------------------------------------------------------------
+BROWSER_DESKTOP=""
 if [[ ${#AUR_PACKAGES[@]} -gt 0 ]]; then
   log_title "Phase 2b: AUR Packages"
 
@@ -281,10 +400,27 @@ if [[ ${#AUR_PACKAGES[@]} -gt 0 ]]; then
   printf '  - %s\n' "${AUR_PACKAGES[@]}"
   "${AUR_HELPER}" -S --needed --noconfirm "${AUR_PACKAGES[@]}"
   log_success "AUR packages installed."
+
+  # Register the browser as default for web links. The .desktop name is read
+  # from the installed package rather than hard-coded, so BROWSER_PKG can be
+  # swapped for any other browser package.
+  if [[ "${INSTALL_BROWSER}" == "yes" ]]; then
+    BROWSER_DESKTOP="$(pacman -Qql "${BROWSER_PKG}" 2>/dev/null \
+      | grep -m1 -E '^/usr/share/applications/[^/]+\.desktop$' | xargs -r basename || true)"
+    if [[ -n "${BROWSER_DESKTOP}" ]]; then
+      if xdg-mime default "${BROWSER_DESKTOP}" x-scheme-handler/http x-scheme-handler/https text/html; then
+        log_success "Default browser set to ${BROWSER_DESKTOP}"
+      else
+        log_warn "Could not set ${BROWSER_DESKTOP} as default browser; set it later with: xdg-settings set default-web-browser ${BROWSER_DESKTOP}"
+      fi
+    else
+      log_warn "No .desktop file found in ${BROWSER_PKG}; default browser not set."
+    fi
+  fi
 fi
 
 # ------------------------------------------------------------------------------
-# Phase 3: Directories
+# Phase 3: Directories & wallpapers
 # ------------------------------------------------------------------------------
 log_title "Phase 3: User Directories"
 
@@ -297,7 +433,6 @@ mkdir -p "${HOME}/.config/niri" \
 log_success "Directories ready (wallpapers: ${WALLPAPER_DIR})."
 
 # Seed the wallpaper directory with the bundled images (never overwrites).
-WALLPAPER_SRC="${SCRIPT_DIR}/config/Wallpapers"
 if compgen -G "${WALLPAPER_SRC}/*" >/dev/null; then
   cp -n "${WALLPAPER_SRC}"/* "${WALLPAPER_DIR}/"
   log_success "Bundled wallpapers copied to ${WALLPAPER_DIR}"
@@ -306,136 +441,31 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# Phase 4: niri configuration
+# Phase 4: Configuration files
 # ------------------------------------------------------------------------------
-log_title "Phase 4: niri Configuration"
+log_title "Phase 4: Configuration Files"
 
-NIRI_CONFIG="${HOME}/.config/niri/config.kdl"
-NIRI_CONFIG_SRC="${SCRIPT_DIR}/config/niri/config.kdl"
+# config/niri/config.kdl is niri's default config with the tutorial's changes
+# applied, plus Noctalia's recommended niri integration. No placeholders, so it
+# is eligible for LINK_CONFIGS=yes.
+install_config "${NIRI_CONFIG_SRC}" "${NIRI_CONFIG}"
 
-if [[ ! -f "${NIRI_CONFIG_SRC}" ]]; then
-  log_error "Bundled niri config not found: ${NIRI_CONFIG_SRC}"
-  log_error "Run this script from a full checkout of the repository (config/niri/config.kdl must exist)."
-  exit 1
-fi
+# config/noctalia/config.toml is the tutorial's settings translated to Noctalia
+# v5 TOML, plus idle lock/screen-off. Placeholders: __UI_FONT__, __THEME__,
+# __WALLPAPER_DIR__.
+install_config "${NOCTALIA_CONFIG_SRC}" "${NOCTALIA_CONFIG}" \
+  -e "s|__UI_FONT__|$(escape_sed "${UI_FONT}")|g" \
+  -e "s|__THEME__|$(escape_sed "${NOCTALIA_THEME}")|g" \
+  -e "s|__WALLPAPER_DIR__|$(escape_sed "${WALLPAPER_DIR}")|g"
 
-# Validate the bundled config BEFORE touching the user's existing one, so a
-# broken repo file never replaces a working config.
-if command -v niri &>/dev/null; then
-  if niri validate -c "${NIRI_CONFIG_SRC}" >/dev/null 2>&1; then
-    log_success "Bundled niri config validated."
-  else
-    log_error "Bundled niri config failed validation; not installing it:"
-    niri validate -c "${NIRI_CONFIG_SRC}" || true
-    exit 1
-  fi
-else
-  log_warn "niri binary not found; skipping config validation."
-fi
-
-if should_write_config "${NIRI_CONFIG}"; then
-  # config/niri/config.kdl is niri's default config with the tutorial's changes
-  # applied, plus Noctalia's recommended niri integration. Edit that file in the
-  # repo to change the defaults; niri reloads the installed copy on save.
-  install -m 0644 "${NIRI_CONFIG_SRC}" "${NIRI_CONFIG}"
-  log_success "Installed ${NIRI_CONFIG_SRC} -> ${NIRI_CONFIG}"
-fi
+# config/alacritty/alacritty.toml. Placeholder: __MONO_FONT__.
+install_config "${ALACRITTY_CONFIG_SRC}" "${ALACRITTY_CONFIG}" \
+  -e "s|__MONO_FONT__|$(escape_sed "${MONO_FONT}")|g"
 
 # ------------------------------------------------------------------------------
-# Phase 5: Noctalia configuration
+# Phase 5: Summary
 # ------------------------------------------------------------------------------
-log_title "Phase 5: Noctalia Configuration"
-
-NOCTALIA_CONFIG="${HOME}/.config/noctalia/config.toml"
-NOCTALIA_CONFIG_SRC="${SCRIPT_DIR}/config/noctalia/config.toml"
-
-if [[ ! -f "${NOCTALIA_CONFIG_SRC}" ]]; then
-  log_error "Bundled Noctalia config not found: ${NOCTALIA_CONFIG_SRC}"
-  log_error "Run this script from a full checkout of the repository (config/noctalia/config.toml must exist)."
-  exit 1
-fi
-
-if should_write_config "${NOCTALIA_CONFIG}"; then
-  # config/noctalia/config.toml is the tutorial's (v4) settings.json translated
-  # to Noctalia v5 TOML. It contains __UI_FONT__, __THEME__ and __WALLPAPER_DIR__
-  # placeholders which are filled from the variables at the top of this script.
-  install -m 0644 "${NOCTALIA_CONFIG_SRC}" "${NOCTALIA_CONFIG}"
-  sed -i \
-    -e "s|__UI_FONT__|$(escape_sed "${UI_FONT}")|g" \
-    -e "s|__THEME__|$(escape_sed "${NOCTALIA_THEME}")|g" \
-    -e "s|__WALLPAPER_DIR__|$(escape_sed "${WALLPAPER_DIR}")|g" \
-    "${NOCTALIA_CONFIG}"
-  log_success "Installed ${NOCTALIA_CONFIG_SRC} -> ${NOCTALIA_CONFIG}"
-fi
-
-# ------------------------------------------------------------------------------
-# Phase 6: Alacritty configuration
-# ------------------------------------------------------------------------------
-log_title "Phase 6: Alacritty Configuration"
-
-ALACRITTY_CONFIG="${HOME}/.config/alacritty/alacritty.toml"
-ALACRITTY_CONFIG_SRC="${SCRIPT_DIR}/config/alacritty/alacritty.toml"
-
-if [[ ! -f "${ALACRITTY_CONFIG_SRC}" ]]; then
-  log_error "Bundled Alacritty config not found: ${ALACRITTY_CONFIG_SRC}"
-  log_error "Run this script from a full checkout of the repository (config/alacritty/alacritty.toml must exist)."
-  exit 1
-fi
-
-if should_write_config "${ALACRITTY_CONFIG}"; then
-  # config/alacritty/alacritty.toml contains a __MONO_FONT__ placeholder which
-  # is filled from the MONO_FONT variable at the top of this script.
-  install -m 0644 "${ALACRITTY_CONFIG_SRC}" "${ALACRITTY_CONFIG}"
-  sed -i -e "s|__MONO_FONT__|$(escape_sed "${MONO_FONT}")|g" "${ALACRITTY_CONFIG}"
-  log_success "Installed ${ALACRITTY_CONFIG_SRC} -> ${ALACRITTY_CONFIG}"
-fi
-
-# ------------------------------------------------------------------------------
-# Phase 7: Start niri automatically on TTY1 (optional)
-# ------------------------------------------------------------------------------
-log_title "Phase 7: Session Autostart"
-
-BASH_PROFILE="${HOME}/.bash_profile"
-AUTOSTART_MARKER="# >>> niriInstall.sh: start niri on TTY1 >>>"
-
-if resolve_choice "${AUTOSTART_NIRI}" "Start niri automatically when you log in on TTY1?" "y"; then
-  LOGIN_SHELL="$(basename "${SHELL:-}")"
-  if [[ "${LOGIN_SHELL}" != "bash" ]]; then
-    log_warn "Your login shell is '${LOGIN_SHELL:-unknown}', not bash. ~/.bash_profile will NOT be read at login,"
-    log_warn "so the TTY1 autostart below will have no effect. Port the snippet to your shell's login file"
-    log_warn "(e.g. ~/.zprofile or ~/.config/fish/config.fish) or switch to bash: chsh -s /bin/bash"
-  fi
-
-  if [[ -f "${BASH_PROFILE}" ]] && grep -qF "${AUTOSTART_MARKER}" "${BASH_PROFILE}"; then
-    log_info "TTY1 autostart already present in ${BASH_PROFILE}"
-  else
-    # If no .bash_profile exists yet, keep bash sourcing ~/.bashrc for login shells.
-    if [[ ! -f "${BASH_PROFILE}" ]]; then
-      printf '[[ -f ~/.bashrc ]] && . ~/.bashrc\n\n' > "${BASH_PROFILE}"
-    fi
-    # XDG_VTNR is set by pam_systemd/logind; avoids forking $(tty).
-    # ~/.no-niri-autostart is an escape hatch: if niri fails to start you would
-    # otherwise be stuck in a login -> exec niri -> crash -> login loop on TTY1.
-    cat >> "${BASH_PROFILE}" <<'PROFILE_EOF'
-
-# >>> niriInstall.sh: start niri on TTY1 >>>
-# To disable temporarily (e.g. niri crashes at login): touch ~/.no-niri-autostart
-if [[ -z "${WAYLAND_DISPLAY:-}" && "${XDG_VTNR:-}" == "1" && ! -e ~/.no-niri-autostart ]]; then
-  exec niri-session
-fi
-# <<< niriInstall.sh <<<
-PROFILE_EOF
-    log_success "TTY1 autostart added to ${BASH_PROFILE}"
-    log_info "Escape hatch: 'touch ~/.no-niri-autostart' from another TTY disables autostart."
-  fi
-else
-  log_info "Skipping autostart. Start niri manually with: niri-session"
-fi
-
-# ------------------------------------------------------------------------------
-# Phase 8: Summary
-# ------------------------------------------------------------------------------
-log_title "Phase 8: Done"
+log_title "Phase 5: Done"
 
 echo
 printf '%s%s%s\n' "${COLOR_SUCCESS}" "========================================================================" "${COLOR_RESET}"
@@ -447,36 +477,38 @@ pkg_ver() { pacman -Q "$1" 2>/dev/null || echo "$1 (not installed)"; }
 
 echo "Installed:"
 echo "  - $(pkg_ver niri) + xwayland-satellite   (compositor)"
-echo "  - $(pkg_ver noctalia)                    (bar / launcher / notifications / lock / wallpaper)"
-echo "  - alacritty, swaybg"
-[[ "${INSTALL_BROWSER}" == "yes" ]] && echo "  - $(pkg_ver "${BROWSER_PKG}") (AUR, via ${AUR_HELPER})"
-echo "  - JetBrainsMono Nerd Font, Noto fonts, xdg-desktop-portal (gnome/gtk)"
+echo "  - $(pkg_ver noctalia)                    (bar / launcher / notifications / lock / idle / wallpaper / clipboard)"
+echo "  - alacritty, swaybg, nautilus, imv, pavucontrol"
+if [[ "${INSTALL_BROWSER}" == "yes" ]]; then
+  echo "  - $(pkg_ver "${BROWSER_PKG}") (AUR, via ${AUR_HELPER}; default browser: ${BROWSER_DESKTOP:-not set})"
+fi
+echo "  - JetBrainsMono Nerd Font, Noto fonts, adwaita-icon-theme, qt5/qt6-wayland"
+echo "  - xdg-desktop-portal (gnome/gtk)"
 if [[ "${IS_LAPTOP}" == "yes" ]]; then
   if [[ "${INSTALL_PPD}" == "yes" ]]; then
-    echo "  - brightnessctl, upower, power-profiles-daemon (laptop)"
+    echo "  - brightnessctl, power-profiles-daemon (laptop)"
   else
-    echo "  - brightnessctl, upower (laptop; power-profiles-daemon skipped due to tlp/auto-cpufreq)"
+    echo "  - brightnessctl (laptop; power-profiles-daemon skipped due to tlp/auto-cpufreq)"
   fi
 fi
 echo
-echo "Config files:"
+echo "Config files (mode: $([[ "${LINK_CONFIGS}" == "yes" ]] && echo "symlink where possible" || echo "copy")):"
 echo "  - ${NIRI_CONFIG}"
 echo "  - ${NOCTALIA_CONFIG}"
 echo "  - ${ALACRITTY_CONFIG}"
 echo
-echo "Keybinds (Mod = Super):"
-echo "  Mod+Return / Mod+T   Terminal            Mod+Space      Noctalia launcher"
-echo "  Mod+N                Noctalia control center"
-echo "  Mod+Q                Close window        Mod+O          Overview"
-echo "  Mod+H/J/K/L          Focus               Mod+Ctrl+HJKL  Move"
-echo "  Mod+1-9              Workspace           Mod+Shift+1-9  Move to workspace"
-echo "  Mod+F / Mod+Shift+F  Maximize / Fullscreen               Mod+S  Screenshot"
-echo "  Super+Alt+L          Lock                Mod+Shift+E    Quit niri"
-echo "  Mod+Shift+/          Show all hotkeys"
+echo "Keybinds (Mod = Super) - press Mod+Shift+/ inside niri for the full list:"
+echo "  Mod+Return   Terminal              Mod+Space    Noctalia launcher"
+echo "  Mod+N        Noctalia control center   Mod+Q    Close window"
+echo "  Mod+O        Overview              Print        Screenshot (region)"
+echo "  Super+Alt+L  Lock                  Mod+Shift+E  Quit niri"
 echo
 echo "Next Steps:"
 echo "  1. Add your own wallpapers to: ${WALLPAPER_DIR} (a few are bundled already)"
-echo "  2. Start niri: log out and back in on TTY1 (if autostart enabled), or run: niri-session"
+echo "  2. Start niri from a TTY with: niri-session"
+echo "     (to auto-start on TTY1, add to ~/.zprofile:"
+echo "      [[ -z \"\$WAYLAND_DISPLAY\" && \"\$XDG_VTNR\" == 1 ]] && exec niri-session)"
 echo "  3. Multi-monitor? Run 'niri msg outputs' and edit the output block in config.kdl."
 echo "  4. Noctalia settings UI: Mod+N -> gear icon, or run: noctalia msg settings-toggle"
+echo "     Idle lock is on (10 min lock, 11 min screen off): [idle.behavior.*] in config.toml"
 echo

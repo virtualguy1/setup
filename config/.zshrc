@@ -6,17 +6,6 @@
 eval "$(starship init zsh)"
 
 # =============================================================================
-# ENVIRONMENT
-# =============================================================================
-export EDITOR="vim"
-export VISUAL="$EDITOR"
-
-# fnm (Fast Node Manager)
-if command -v fnm >/dev/null 2>&1; then
-  eval "$(fnm env --use-on-cd --shell zsh)"
-fi
-
-# =============================================================================
 # HISTORY
 # =============================================================================
 HISTFILE="$HOME/.zsh_history"
@@ -112,13 +101,3 @@ azclean() {
 if command -v fastfetch >/dev/null 2>&1; then
   fastfetch --logo none --structure os:uptime:memory:disk:swap:packages:battery:localip
 fi
-
-
-# Added by Antigravity CLI installer
-export PATH="/Users/abhinav/.local/bin:$PATH"
-export PATH="/Users/abhinav/.local/bin:$PATH"
-export PATH="/Users/abhinav/.local/bin:$PATH"
-
-# bun
-export BUN_INSTALL="$HOME/.bun"
-export PATH="$BUN_INSTALL/bin:$PATH"
